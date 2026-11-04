@@ -1,0 +1,950 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Benny's Gentle Adventure</title>
+<style>
+  @font-face { font-family: "Fredoka"; font-weight: 600; src: url("fonts/fredoka-latin-600-normal.woff2") format("woff2"); }
+  @font-face { font-family: "Fredoka"; font-weight: 500; src: url("fonts/fredoka-latin-500-normal.woff2") format("woff2"); }
+  html, body { margin: 0; padding: 0; background: #fff6ea; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1920" height="1080"></canvas>
+<script>
+"use strict";
+// ============================================================ core utils ==
+const W = 1920, H = 1080;
+const cv = document.getElementById("c");
+const ctx = cv.getContext("2d");
+const off = document.createElement("canvas");
+off.width = W; off.height = H;
+const octx = off.getContext("2d");
+let TL = null; // timeline (injected)
+let X = ctx;   // active context
+
+const PI = Math.PI, TAU = 2 * Math.PI;
+const clamp = (v, a = 0, b = 1) => Math.min(b, Math.max(a, v));
+const lerp = (a, b, k) => a + (b - a) * k;
+const smooth = (k) => { k = clamp(k); return k * k * (3 - 2 * k); };
+const easeOut = (k) => { k = clamp(k); return 1 - Math.pow(1 - k, 3); };
+const easeBack = (k) => { k = clamp(k); const c = 1.6; return 1 + (c + 1) * Math.pow(k - 1, 3) + c * Math.pow(k - 1, 2); };
+function rng(seed) { let s = seed >>> 0; return () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+function hexToRgb(h) { const n = parseInt(h.slice(1), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; }
+function mix(c1, c2, k) {
+  const a = hexToRgb(c1), b = hexToRgb(c2);
+  return `rgb(${Math.round(lerp(a[0], b[0], k))},${Math.round(lerp(a[1], b[1], k))},${Math.round(lerp(a[2], b[2], k))})`;
+}
+// cue helpers (absolute seconds)
+const cue = (id) => TL.cues[id];
+const since = (t, id, off = 0) => t - (cue(id).start + off);
+const prog = (t, id, dur = 1, off = 0) => clamp(since(t, id, off) / dur);
+function talking(t, spk) {
+  for (const l of TL.lines) if (l.spk === spk && t >= l.start && t <= l.end) {
+    const env = clamp((t - l.start) / 0.08) * clamp((l.end - t) / 0.08);
+    return env * (0.35 + 0.65 * Math.abs(Math.sin(t * 11.0) * Math.sin(t * 6.3 + 1)));
+  }
+  return 0;
+}
+const blinkAt = (t, seed = 0) => ((t + seed) % 3.9) < 0.13;
+
+// ------------------------------------------------------ shape primitives --
+const OUTLINE = "rgba(110,72,48,0.28)";
+function path(fill, stroke = OUTLINE, lw = 3) {
+  if (fill) { X.fillStyle = fill; X.fill(); }
+  if (stroke) { X.strokeStyle = stroke; X.lineWidth = lw; X.stroke(); }
+}
+function circle(x, y, r, fill, stroke = OUTLINE, lw) { X.beginPath(); X.arc(x, y, r, 0, TAU); path(fill, stroke, lw); }
+function ellipse(x, y, rx, ry, fill, stroke = OUTLINE, rot = 0, lw) {
+  X.beginPath(); X.ellipse(x, y, Math.abs(rx), Math.abs(ry), rot, 0, TAU); path(fill, stroke, lw);
+}
+function rrect(x, y, w, h, r, fill, stroke = OUTLINE, lw) {
+  X.beginPath(); X.roundRect(x, y, w, h, r); path(fill, stroke, lw);
+}
+function heart(x, y, s, fill, alpha = 1) {
+  X.save(); X.globalAlpha *= alpha; X.translate(x, y); X.scale(s, s);
+  X.beginPath(); X.moveTo(0, 6);
+  X.bezierCurveTo(-14, -4, -10, -18, 0, -10);
+  X.bezierCurveTo(10, -18, 14, -4, 0, 6);
+  X.fillStyle = fill; X.fill(); X.restore();
+}
+function sparkle(x, y, r, fill, alpha = 1, rot = 0) {
+  X.save(); X.globalAlpha *= alpha; X.translate(x, y); X.rotate(rot);
+  X.beginPath();
+  for (let i = 0; i < 8; i++) {
+    const a = (i / 8) * TAU, rr = i % 2 ? r * 0.32 : r;
+    X.lineTo(Math.cos(a) * rr, Math.sin(a) * rr);
+  }
+  X.closePath(); X.fillStyle = fill; X.fill(); X.restore();
+}
+function star5(x, y, r, fill, stroke = null) {
+  X.beginPath();
+  for (let i = 0; i < 10; i++) {
+    const a = -PI / 2 + (i / 10) * TAU, rr = i % 2 ? r * 0.48 : r;
+    X.lineTo(x + Math.cos(a) * rr, y + Math.sin(a) * rr);
+  }
+  X.closePath(); X.lineJoin = "round"; path(fill, stroke, 2.5);
+}
+function musicNote(x, y, s, fill, alpha) {
+  X.save(); X.globalAlpha *= alpha; X.translate(x, y); X.scale(s, s);
+  X.fillStyle = fill; X.strokeStyle = fill; X.lineWidth = 4;
+  X.beginPath(); X.ellipse(0, 0, 10, 7, -0.4, 0, TAU); X.fill();
+  X.beginPath(); X.moveTo(9, -2); X.lineTo(9, -38); X.quadraticCurveTo(22, -30, 20, -18); X.stroke();
+  X.restore();
+}
+function text(str, x, y, size, fill, opts = {}) {
+  X.save();
+  X.font = `${opts.weight || 600} ${size}px Fredoka, "Comic Sans MS", sans-serif`;
+  X.textAlign = opts.align || "center"; X.textBaseline = "middle";
+  X.globalAlpha *= opts.alpha == null ? 1 : opts.alpha;
+  if (opts.outline) { X.lineJoin = "round"; X.lineWidth = opts.outlineW || size * 0.16; X.strokeStyle = opts.outline; X.strokeText(str, x, y); }
+  if (opts.shadow) { X.shadowColor = opts.shadow; X.shadowBlur = 18; X.shadowOffsetY = 6; }
+  X.fillStyle = fill; X.fillText(str, x, y);
+  X.restore();
+}
+
+// ============================================================ characters ==
+// BENNY — little caramel bear cub in a mint shirt with a yellow star.
+const BENNY = {
+  fur: "#C88D5C", furDark: "#B47A4A", muzzle: "#F5DDB6", earIn: "#F4B5A4",
+  shirt: "#8ED6C4", shirtDark: "#79C6B3", starC: "#FFE07A", eye: "#3B2A20", nose: "#5A3A2A",
+};
+function drawBenny(x, y, s, o = {}) {
+  const t = o.t || 0;
+  const B = BENNY;
+  X.save();
+  X.translate(x, y);
+  X.scale(s * (o.face || 1), s);
+  const walking = !!o.walking;
+  const ph = o.phase || 0;
+  const bob = walking ? -Math.abs(Math.sin(ph)) * 9 : Math.sin(t * 2.1) * 2;
+  // legs
+  if (!o.noLegs) {
+    for (const side of [-1, 1]) {
+      const lift = walking ? Math.max(0, Math.sin(ph + (side > 0 ? 0 : PI))) * 16 : 0;
+      const sw = walking ? Math.sin(ph + (side > 0 ? 0 : PI)) * 6 : 0;
+      rrect(side * 30 - 21 + sw, -64 - lift, 42, 62, 20, B.furDark);
+      ellipse(side * 30 + sw, -10 - lift, 24, 12, B.muzzle, null);
+    }
+  }
+  X.translate(0, bob + (o.dy || 0));
+  X.rotate(o.lean || 0);
+  // arm helper: outward angle (0 = hanging), side -1 left / 1 right
+  const arm = (side, outward, item) => {
+    X.save();
+    X.translate(side * 58, -158);
+    X.rotate(-side * outward);
+    rrect(-16, -6, 32, 74, 16, B.fur);
+    circle(0, 66, 17, B.muzzle);
+    if (item === "strawberry") drawStrawberry(0, 92, 1.0);
+    X.restore();
+  };
+  const armsUp = o.armsUp || 0;
+  let la = lerp(0.28, 2.55, armsUp), ra = lerp(0.28, 2.55, armsUp);
+  if (walking) { la += Math.sin(ph) * 0.25; ra -= Math.sin(ph) * 0.25; }
+  if (o.wave) ra = lerp(ra, 2.55 + Math.sin(t * 7.5) * 0.32, o.wave);
+  if (o.offer) ra = lerp(ra, 1.35, o.offer);
+  if (o.hug) { la = lerp(la, 1.1, o.hug); ra = lerp(ra, 1.1, o.hug); }
+  arm(-1, la, null);
+  // body
+  ellipse(0, -122, 72, 78, B.fur);
+  X.save();
+  X.beginPath(); X.ellipse(0, -122, 70, 76, 0, 0, TAU); X.clip();
+  X.fillStyle = B.shirt; X.fillRect(-80, -150, 160, 120);
+  X.fillStyle = B.shirtDark; X.fillRect(-80, -152, 160, 8);
+  X.restore();
+  star5(0, -104, 17, B.starC, "rgba(200,150,40,0.45)");
+  arm(1, ra, o.holding);
+  // head
+  X.save();
+  X.translate(0, -232);
+  X.rotate(o.tilt || 0);
+  for (const side of [-1, 1]) { circle(side * 62, -64, 31, B.fur); circle(side * 62, -64, 17, B.earIn, null); }
+  circle(0, 0, 90, B.fur);
+  ellipse(0, 30, 44, 33, B.muzzle, null);
+  ellipse(0, 16, 15, 11, B.nose, null);
+  ellipse(-4, 12, 5, 3, "rgba(255,255,255,0.6)", null);
+  // mouth
+  const talk = o.talk || 0;
+  X.strokeStyle = B.nose; X.lineWidth = 4.5; X.lineCap = "round";
+  if (talk > 0.05) {
+    ellipse(0, 41, 11, 4 + 10 * talk, "#8A4B3C", null);
+    ellipse(0, 44 + 6 * talk, 7, 3 * talk + 1, "#F59AA0", null);
+  } else {
+    X.beginPath(); X.moveTo(0, 27); X.lineTo(0, 33); X.stroke();
+    X.beginPath(); X.arc(-10, 33, 10, 0.1 * PI, 0.9 * PI); X.stroke();
+    X.beginPath(); X.arc(10, 33, 10, 0.1 * PI, 0.9 * PI); X.stroke();
+  }
+  // eyes
+  const eyes = o.eyes || (blinkAt(t, o.seed || 0) ? "closed" : "open");
+  const lx = o.lookX || 0, ly = o.lookY || 0;
+  for (const side of [-1, 1]) {
+    const ex = side * 33, ey = -12;
+    if (eyes === "open") {
+      ellipse(ex + lx, ey + ly, 11, 13, B.eye, null);
+      circle(ex + lx + 4, ey + ly - 5, 4.2, "#fff", null);
+    } else if (eyes === "happy") {
+      X.strokeStyle = B.eye; X.lineWidth = 5;
+      X.beginPath(); X.arc(ex, ey + 6, 11, 1.15 * PI, 1.85 * PI); X.stroke();
+    } else {
+      X.strokeStyle = B.eye; X.lineWidth = 5;
+      X.beginPath(); X.arc(ex, ey - 4, 11, 0.15 * PI, 0.85 * PI); X.stroke();
+    }
+  }
+  circle(-60, 22, 15, "rgba(247,130,140,0.42)", null);
+  circle(60, 22, 15, "rgba(247,130,140,0.42)", null);
+  X.restore();
+  X.restore();
+}
+
+function drawStrawberry(x, y, s) {
+  X.save(); X.translate(x, y); X.scale(s, s);
+  X.beginPath(); X.moveTo(0, 22); X.bezierCurveTo(-24, 6, -18, -14, 0, -12); X.bezierCurveTo(18, -14, 24, 6, 0, 22);
+  path("#FF8A8A", "rgba(180,70,70,0.4)");
+  for (const [sx, sy] of [[-7, -2], [6, -3], [0, 6], [-4, 12], [5, 11]]) ellipse(sx, sy, 1.6, 2.4, "#FFE6A3", null);
+  for (let i = -1; i <= 1; i++) ellipse(i * 6, -14, 5, 3, "#7CC67A", null, i * 0.5);
+  X.restore();
+}
+
+// BUNNY
+function drawBunny(x, y, s, o = {}) {
+  const t = o.t || 0;
+  const body = o.color || "#FFFFFF", earIn = o.earIn || "#FFC8CF";
+  X.save(); X.translate(x, y);
+  const hop = o.hopping ? Math.abs(Math.sin(o.phase || 0)) : 0;
+  X.translate(0, -hop * 34 * s);
+  X.scale(s * (o.face || 1), s * (1 - hop * 0.04));
+  ellipse(-46, -36, 15, 15, "#fff");
+  ellipse(-14, -6, 20, 9, body);
+  ellipse(26, -6, 20, 9, body);
+  ellipse(0, -44, 48, 42, body);
+  ellipse(6, -36, 26, 24, "rgba(255,240,235,0.9)", null);
+  if (o.holding === "strawberry") drawStrawberry(26, -52, 0.85);
+  // head
+  X.save(); X.translate(12, -98); X.rotate(o.tilt || 0);
+  const wig = Math.sin(t * 3 + (o.seed || 0)) * 0.06 + (o.earPerk || 0) * -0.12;
+  for (const [ex, er] of [[-12, -0.18], [16, 0.16]]) {
+    X.save(); X.translate(ex, -30); X.rotate(er + wig);
+    ellipse(0, -30, 12, 38, body);
+    ellipse(0, -28, 6, 28, earIn, null);
+    X.restore();
+  }
+  circle(0, 0, 37, body);
+  const eyes = o.eyes || (blinkAt(t, (o.seed || 0) + 1.3) ? "closed" : "open");
+  for (const ex of [-13, 15]) {
+    if (eyes === "open") { circle(ex + (o.lookX || 0), -4, 6.5, "#3E2C2A", null); circle(ex + 2 + (o.lookX || 0), -7, 2.4, "#fff", null); }
+    else { X.strokeStyle = "#3E2C2A"; X.lineWidth = 3.5; X.lineCap = "round"; X.beginPath(); X.arc(ex, -2, 6, 1.15 * PI, 1.85 * PI); X.stroke(); }
+  }
+  ellipse(1, 8, 5, 4, "#F7A0AE", null);
+  const talk = o.talk || 0;
+  X.strokeStyle = "#9A6B60"; X.lineWidth = 2.5;
+  if (talk > 0.05) ellipse(1, 18, 5, 2 + 5 * talk, "#C46E72", null);
+  else { X.beginPath(); X.arc(-3, 14, 4, 0.1 * PI, 0.9 * PI); X.stroke(); X.beginPath(); X.arc(5, 14, 4, 0.1 * PI, 0.9 * PI); X.stroke(); }
+  circle(-25, 10, 7, "rgba(247,130,150,0.4)", null);
+  circle(27, 10, 7, "rgba(247,130,150,0.4)", null);
+  if (o.bow) { // tiny blue bow on the little bunny
+    X.save(); X.translate(14, -32);
+    ellipse(-9, 0, 9, 6, "#9CC9F5", "rgba(70,110,160,0.4)", -0.3);
+    ellipse(9, 0, 9, 6, "#9CC9F5", "rgba(70,110,160,0.4)", 0.3);
+    circle(0, 0, 4, "#7FB6EE", null);
+    X.restore();
+  }
+  X.restore();
+  X.restore();
+}
+
+function drawButterfly(x, y, s, ph, c1, c2, rot = 0) {
+  X.save(); X.translate(x, y); X.rotate(rot); X.scale(s, s);
+  const f = 0.25 + 0.75 * Math.abs(Math.cos(ph));
+  for (const side of [-1, 1]) {
+    X.save(); X.scale(side * f, 1);
+    ellipse(22, -14, 24, 18, c1, "rgba(120,90,130,0.3)", -0.5);
+    ellipse(18, 12, 15, 12, c2, "rgba(120,90,130,0.3)", 0.5);
+    circle(24, -16, 6, "rgba(255,255,255,0.6)", null);
+    X.restore();
+  }
+  ellipse(0, 0, 4.5, 16, "#7D6A86", null);
+  X.strokeStyle = "#7D6A86"; X.lineWidth = 2;
+  X.beginPath(); X.moveTo(-2, -14); X.quadraticCurveTo(-8, -26, -12, -28); X.stroke();
+  X.beginPath(); X.moveTo(2, -14); X.quadraticCurveTo(8, -26, 12, -28); X.stroke();
+  circle(-12, -28, 2.5, "#7D6A86", null); circle(12, -28, 2.5, "#7D6A86", null);
+  X.restore();
+}
+
+const PETALS = ["#F7A8C4", "#C9B3F2", "#FFE07A", "#FFC09F", "#FFFFFF", "#A9D8F5"];
+function drawFlower(x, gy, h, r, petal, centerC, sway, petals = 6) {
+  const hx = x + sway, hy = gy - h;
+  X.strokeStyle = "#6FBF73"; X.lineWidth = Math.max(3, r * 0.22); X.lineCap = "round";
+  X.beginPath(); X.moveTo(x, gy); X.quadraticCurveTo(x + sway * 0.2, gy - h * 0.5, hx, hy); X.stroke();
+  ellipse(x + sway * 0.3 + r * 0.5, gy - h * 0.38, r * 0.55, r * 0.25, "#7CC97E", null, -0.5);
+  for (let i = 0; i < petals; i++) {
+    const a = (i / petals) * TAU + sway * 0.01;
+    ellipse(hx + Math.cos(a) * r * 0.62, hy + Math.sin(a) * r * 0.62, r * 0.55, r * 0.38, petal, "rgba(140,100,120,0.18)", a, 2);
+  }
+  circle(hx, hy, r * 0.4, centerC, "rgba(170,120,60,0.3)", 2);
+}
+function drawDaisy(x, gy, h, r, sway) { drawFlower(x, gy, h, r, "#FFFFFF", "#FFD45C", sway, 10); }
+function drawSunflower(x, gy, h, r, sway) {
+  const hx = x + sway, hy = gy - h;
+  X.strokeStyle = "#6FBF73"; X.lineWidth = 9; X.lineCap = "round";
+  X.beginPath(); X.moveTo(x, gy); X.quadraticCurveTo(x, gy - h / 2, hx, hy); X.stroke();
+  ellipse(x - 26, gy - h * 0.45, 28, 12, "#7CC97E", null, 0.5);
+  for (let i = 0; i < 14; i++) {
+    const a = (i / 14) * TAU;
+    ellipse(hx + Math.cos(a) * r * 0.75, hy + Math.sin(a) * r * 0.75, r * 0.42, r * 0.2, "#FFD45C", "rgba(190,140,40,0.3)", a, 2);
+  }
+  circle(hx, hy, r * 0.48, "#C99A6A", "rgba(120,80,40,0.3)");
+  // friendly face on sunflower
+  X.strokeStyle = "#7A5534"; X.lineWidth = 3;
+  X.beginPath(); X.arc(hx - r * 0.16, hy - r * 0.06, r * 0.08, 1.1 * PI, 1.9 * PI); X.stroke();
+  X.beginPath(); X.arc(hx + r * 0.16, hy - r * 0.06, r * 0.08, 1.1 * PI, 1.9 * PI); X.stroke();
+  X.beginPath(); X.arc(hx, hy + r * 0.05, r * 0.16, 0.15 * PI, 0.85 * PI); X.stroke();
+}
+
+// ========================================================== environment ==
+const SKY = {
+  morning: ["#9FD8F5", "#CDEBF7", "#FDEBD3"],
+  day: ["#8FD0F2", "#C4E7F6", "#F3F6E6"],
+  sunset: ["#F3A9C0", "#FBC490", "#FFE6A8"],
+  dusk: ["#9F9BD8", "#E7A9C7", "#FFD3B0"],
+};
+function drawSky(pal) {
+  const g = X.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, pal[0]); g.addColorStop(0.55, pal[1]); g.addColorStop(1, pal[2]);
+  X.fillStyle = g; X.fillRect(-200, -200, W + 400, H + 400);
+}
+function drawSun(x, y, r, t, opts = {}) {
+  const g = X.createRadialGradient(x, y, r * 0.6, x, y, r * 3);
+  g.addColorStop(0, opts.glow || "rgba(255,240,170,0.75)"); g.addColorStop(1, "rgba(255,240,170,0)");
+  X.fillStyle = g; X.beginPath(); X.arc(x, y, r * 3, 0, TAU); X.fill();
+  X.save(); X.translate(x, y); X.rotate(t * 0.1);
+  for (let i = 0; i < 12; i++) {
+    X.rotate(TAU / 12);
+    rrect(-7, r + 12 + Math.sin(t * 2 + i) * 4, 14, 30, 7, opts.ray || "#FFE58A", null);
+  }
+  X.restore();
+  circle(x, y, r, opts.fill || "#FFD95C", "rgba(230,170,60,0.35)", 4);
+  if (opts.face !== false) {
+    X.strokeStyle = "#C98A3A"; X.lineWidth = 5; X.lineCap = "round";
+    X.beginPath(); X.arc(x - r * 0.32, y - r * 0.08, r * 0.14, 1.1 * PI, 1.9 * PI); X.stroke();
+    X.beginPath(); X.arc(x + r * 0.32, y - r * 0.08, r * 0.14, 1.1 * PI, 1.9 * PI); X.stroke();
+    X.beginPath(); X.arc(x, y + r * 0.12, r * 0.3, 0.15 * PI, 0.85 * PI); X.stroke();
+    circle(x - r * 0.55, y + r * 0.2, r * 0.12, "rgba(250,140,120,0.4)", null);
+    circle(x + r * 0.55, y + r * 0.2, r * 0.12, "rgba(250,140,120,0.4)", null);
+  }
+}
+function drawCloud(x, y, s, alpha = 0.95, tint = "#FFFFFF") {
+  X.save(); X.globalAlpha *= alpha; X.translate(x, y); X.scale(s, s);
+  X.fillStyle = tint;
+  for (const [cx, cy, r] of [[-70, 10, 42], [-25, -18, 55], [30, -10, 50], [75, 12, 38], [0, 18, 46]]) {
+    X.beginPath(); X.arc(cx, cy, r, 0, TAU); X.fill();
+  }
+  X.restore();
+}
+function drawClouds(t, tint = "#FFFFFF", alpha = 0.92) {
+  const cl = [[200, 170, 1.0, 14], [820, 110, 0.8, 9], [1450, 200, 1.15, 12], [1900, 130, 0.75, 10]];
+  for (const [x, y, s, sp] of cl) {
+    const xx = ((x + t * sp) % (W + 400)) - 200;
+    drawCloud(xx, y, s, alpha, tint);
+  }
+}
+function hill(yBase, amp, freq, phase, color, scroll = 0) {
+  X.beginPath(); X.moveTo(-50, H + 50);
+  for (let x = -50; x <= W + 50; x += 20) {
+    const xx = x + scroll;
+    X.lineTo(x, yBase - amp * (0.6 * Math.sin(xx * freq + phase) + 0.4 * Math.sin(xx * freq * 2.3 + phase * 1.7)));
+  }
+  X.lineTo(W + 50, H + 50); X.closePath(); X.fillStyle = color; X.fill();
+}
+function hills(scroll, tint = 0) {
+  const t = (c) => tint ? mix(c, "#F7B890", tint) : c;
+  hill(640, 60, 0.0022, 1.0, t("#CBEBB3"), scroll * 0.2);
+  hill(730, 50, 0.003, 2.4, t("#B4E39D"), scroll * 0.45);
+  hill(850, 30, 0.004, 0.3, t("#9FD98A"), scroll * 0.8);
+}
+function drawGround(y, color = "#9AD686") { X.fillStyle = color; X.fillRect(-100, y, W + 200, H - y + 100); }
+function drawBush(x, y, s, color = "#86CB7E", blossoms = "#F7B6CF") {
+  X.save(); X.translate(x, y); X.scale(s, s);
+  for (const [cx, cy, r] of [[-60, -40, 50], [0, -70, 65], [60, -40, 52], [0, -30, 55]]) circle(cx, cy, r, color, "rgba(70,120,60,0.25)");
+  for (const [bx, by] of [[-50, -60], [10, -100], [40, -50], [-10, -40], [65, -70]]) {
+    for (let i = 0; i < 5; i++) { const a = (i / 5) * TAU; circle(bx + Math.cos(a) * 7, by + Math.sin(a) * 7, 6, blossoms, null); }
+    circle(bx, by, 4.5, "#FFE07A", null);
+  }
+  X.restore();
+}
+function drawPath(scroll, y0 = 900) {
+  X.fillStyle = "#F4DDB6";
+  X.beginPath(); X.moveTo(-100, y0 + 60);
+  for (let x = -100; x <= W + 100; x += 30) X.lineTo(x, y0 + 10 * Math.sin((x + scroll) * 0.004));
+  for (let x = W + 100; x >= -100; x -= 30) X.lineTo(x, y0 + 90 + 10 * Math.sin((x + scroll) * 0.004 + 1));
+  X.closePath(); X.fill();
+  const r = rng(42);
+  for (let i = 0; i < 40; i++) {
+    const wx = i * 160 + r() * 80;
+    const sx = ((wx - scroll) % 6400 + 6400) % 6400 - 100;
+    if (sx > -40 && sx < W + 40) ellipse(sx, y0 + 30 + r() * 40, 12, 6, "#E7C99B", null);
+  }
+}
+
+function drawTree(cx, groundY, t, pal = null) {
+  const leaf = pal || ["#8ED081", "#7BC47F", "#A6DC8F"];
+  // trunk
+  X.fillStyle = "#A9744F";
+  X.beginPath();
+  X.moveTo(cx - 70, groundY); X.quadraticCurveTo(cx - 40, groundY - 200, cx - 45, 330);
+  X.lineTo(cx + 45, 330); X.quadraticCurveTo(cx + 40, groundY - 200, cx + 70, groundY);
+  X.closePath(); X.fill(); X.strokeStyle = OUTLINE; X.lineWidth = 3; X.stroke();
+  X.strokeStyle = "rgba(120,80,50,0.35)"; X.lineWidth = 4;
+  for (const [a, b] of [[-20, 760], [15, 690], [-10, 620]]) { X.beginPath(); X.arc(cx + a, b, 14, 0.2, PI - 0.2); X.stroke(); }
+  // foliage
+  const sw = Math.sin(t * 0.8) * 4;
+  const blobs = [[-260, 230, 120, 0], [-130, 150, 140, 1], [40, 120, 150, 2], [210, 170, 135, 0], [300, 280, 110, 1], [-300, 340, 100, 2], [0, 260, 150, 0], [160, 320, 120, 2], [-160, 330, 120, 1]];
+  for (const [bx, by, r, c] of blobs) circle(cx + bx + sw * (by / 300), by, r, leaf[c], "rgba(70,120,60,0.22)");
+  const r = rng(7);
+  for (let i = 0; i < 14; i++) circle(cx - 300 + r() * 600, 120 + r() * 260, 10, "rgba(255,255,255,0.18)", null);
+}
+function drawTreehouse(cx, platY, t, o = {}) {
+  // platform
+  rrect(cx - 220, platY, 440, 26, 10, "#C98F65");
+  for (let i = -3; i <= 3; i++) rrect(cx + i * 60 - 6, platY + 26, 12, 30, 4, "#B67F58");
+  // railing posts
+  X.strokeStyle = "#B67F58"; X.lineWidth = 8;
+  X.beginPath(); X.moveTo(cx - 215, platY - 40); X.lineTo(cx - 215, platY); X.moveTo(cx + 215, platY - 40); X.lineTo(cx + 215, platY); X.stroke();
+  X.beginPath(); X.moveTo(cx - 215, platY - 38); X.lineTo(cx - 175, platY - 38); X.moveTo(cx + 175, platY - 38); X.lineTo(cx + 215, platY - 38); X.stroke();
+  // walls
+  rrect(cx - 170, platY - 190, 340, 190, 14, o.wall || "#F4C987");
+  X.strokeStyle = "rgba(190,130,70,0.3)"; X.lineWidth = 3;
+  for (let yy = platY - 160; yy < platY; yy += 32) { X.beginPath(); X.moveTo(cx - 165, yy); X.lineTo(cx + 165, yy); X.stroke(); }
+  // roof
+  X.beginPath(); X.moveTo(cx - 205, platY - 180); X.quadraticCurveTo(cx, platY - 330, cx + 205, platY - 180); X.closePath();
+  path(o.roof || "#F08F7E");
+  circle(cx, platY - 276, 10, "#FFE07A", null);
+  // round window
+  const wx = cx - 55, wy = platY - 100;
+  circle(wx, wy, 60, "#B9805A");
+  X.save(); X.beginPath(); X.arc(wx, wy, 50, 0, TAU); X.clip();
+  X.fillStyle = o.windowFill || "#FFF4C2"; X.fillRect(wx - 60, wy - 60, 120, 120);
+  if (o.benny) o.benny(wx, wy);
+  X.restore();
+  X.strokeStyle = "#B9805A"; X.lineWidth = 6;
+  X.beginPath(); X.moveTo(wx - 50, wy); X.lineTo(wx + 50, wy); X.moveTo(wx, wy - 50); X.lineTo(wx, wy + 50); X.stroke();
+  // door
+  rrect(cx + 50, platY - 140, 80, 140, [40, 40, 6, 6], "#D99A6C");
+  circle(cx + 112, platY - 70, 6, "#FFE07A", null);
+  // flower box
+  rrect(wx - 55, wy + 62, 110, 22, 6, "#C98F65");
+  for (let i = 0; i < 4; i++) { circle(wx - 38 + i * 25, wy + 58, 9, PETALS[i], null); circle(wx - 38 + i * 25, wy + 58, 3.5, "#FFD45C", null); }
+  // bunting
+  X.strokeStyle = "#B9805A"; X.lineWidth = 2;
+  X.beginPath(); X.moveTo(cx - 170, platY - 185); X.quadraticCurveTo(cx, platY - 150, cx + 170, platY - 185); X.stroke();
+  for (let i = 0; i < 7; i++) {
+    const k = (i + 0.5) / 7, bx = lerp(cx - 170, cx + 170, k), by = platY - 185 + Math.sin(k * PI) * 26;
+    X.beginPath(); X.moveTo(bx - 12, by); X.lineTo(bx + 12, by); X.lineTo(bx, by + 22); X.closePath();
+    X.fillStyle = PETALS[i % 4]; X.fill();
+  }
+  // ladder
+  const lx = cx - 150, ly0 = platY + 26, ly1 = o.groundY || 900;
+  X.strokeStyle = "#B67F58"; X.lineWidth = 9;
+  X.beginPath(); X.moveTo(lx - 22, ly0); X.lineTo(lx - 30, ly1); X.moveTo(lx + 22, ly0); X.lineTo(lx + 30, ly1); X.stroke();
+  X.lineWidth = 7;
+  for (let yy = ly0 + 30; yy < ly1; yy += 48) { const k = (yy - ly0) / (ly1 - ly0); X.beginPath(); X.moveTo(lx - 22 - 8 * k, yy); X.lineTo(lx + 22 + 8 * k, yy); X.stroke(); }
+}
+
+function floatingSparkles(t, n, seed, color, alpha = 0.7, area = [0, 0, W, H]) {
+  const r = rng(seed);
+  for (let i = 0; i < n; i++) {
+    const x0 = area[0] + r() * area[2], y0 = area[1] + r() * area[3], sp = 8 + r() * 18, ph = r() * TAU, sz = 6 + r() * 10;
+    const y = y0 - ((t * sp) % area[3]);
+    const yy = y < area[1] ? y + area[3] : y;
+    const a = alpha * (0.5 + 0.5 * Math.sin(t * 2 + ph));
+    sparkle(x0 + Math.sin(t * 0.7 + ph) * 20, yy, sz, color, a, t * 0.5 + ph);
+  }
+}
+function risingHearts(t, t0, x, y, n, color = "#FF9FB5", spread = 120) {
+  const r = rng(Math.floor(x));
+  for (let i = 0; i < n; i++) {
+    const d = r() * 1.6, life = 2.6;
+    const k = (t - t0 - d) / life;
+    if (k < 0 || k > 1) continue;
+    const hx = x + (r() - 0.5) * spread + Math.sin(k * 6 + i) * 14;
+    const hy = y - k * 200;
+    heart(hx, hy, 1.4 + r() * 0.8, color, Math.sin(k * PI));
+  }
+}
+function zzz(t, x, y, alpha) {
+  for (let i = 0; i < 3; i++) {
+    const k = ((t * 0.45 + i / 3) % 1);
+    text("z", x + k * 60 + i * 6, y - k * 110, 30 + k * 26, "#9AA9E6", { alpha: alpha * Math.sin(k * PI), weight: 600 });
+  }
+}
+
+function zoomAt(z, ax, ay) { X.translate(ax, ay); X.scale(z, z); X.translate(-ax, -ay); }
+const MZ = 1.28; // meadow camera zoom (anchored bottom-center)
+
+// =============================================================== scenes ==
+const S = {};
+
+S.title = (t, lt) => {
+  drawSky(SKY.morning);
+  floatingSparkles(t, 26, 3, "#FFFFFF", 0.8);
+  drawSun(1580, 220, 90, t);
+  drawClouds(t);
+  hills(t * 6);
+  drawGround(940, "#9AD686");
+  const r = rng(11);
+  for (let i = 0; i < 26; i++) drawFlower(r() * W, 1000 + r() * 60, 40 + r() * 30, 18 + r() * 8, PETALS[i % 6], "#FFD45C", Math.sin(t * 1.4 + i) * 6);
+  const k = easeBack((lt - 0.4) / 1.2);
+  X.save(); X.translate(W / 2, 330); X.scale(lerp(0.6, 1, k), lerp(0.6, 1, k)); X.globalAlpha = clamp((lt - 0.4) / 0.6);
+  text("Benny's Gentle Adventure", 0, 0, 118, "#FF8FA8", { outline: "#FFFFFF", outlineW: 22, shadow: "rgba(200,120,140,0.35)" });
+  X.restore();
+  text("A Calm & Joyful Journey", W / 2, 460, 56, "#6FB7C9", { outline: "#FFFFFF", outlineW: 14, alpha: clamp((lt - 1.2) / 0.8), weight: 500 });
+  const by = lerp(1250, 980, easeOut((lt - 0.8) / 1.4));
+  drawBenny(W / 2, by, 1.05, { t, wave: smooth((lt - 1.8) / 0.6), talk: 0, seed: 0.5 });
+};
+
+S.tree_ext = (t, lt, sc) => {
+  const k = clamp(lt / (sc.end - sc.start));
+  X.save();
+  const z = lerp(1.0, 1.18, smooth(k));
+  X.translate(1060, 520); X.scale(z, z); X.translate(-1060, -520);
+  drawSky(SKY.morning);
+  drawSun(360, lerp(640, 300, easeOut(k * 1.3)), 85, t);
+  drawClouds(t);
+  hills(t * 3);
+  drawGround(900);
+  drawTree(1060, 905, t);
+  const benAp = cue("intro_benny") ? smooth(since(t, "intro_benny", 0.4) / 1.0) : 0;
+  drawTreehouse(1060, 560, t, {
+    groundY: 905,
+    benny: benAp > 0 ? (wx, wy) => { X.globalAlpha = benAp; drawBenny(wx, wy + 165, 0.62, { t, eyes: "closed", noLegs: true, tilt: 0.12, seed: 0 }); X.globalAlpha = 1; } : null,
+  });
+  if (benAp > 0) zzz(t, 1030, 420, benAp);
+  const r = rng(5);
+  for (let i = 0; i < 30; i++) drawFlower(r() * W, 930 + r() * 130, 30 + r() * 30, 15 + r() * 8, PETALS[i % 6], "#FFD45C", Math.sin(t * 1.3 + i) * 5);
+  drawBush(300, 960, 1.0); drawBush(1720, 980, 0.9, "#8FD08A", "#C9B3F2");
+  X.restore();
+};
+
+function roomInterior(t, evening) {
+  // wall
+  X.fillStyle = evening ? "#F2CBA8" : "#F7DDB9"; X.fillRect(0, 0, W, H);
+  X.strokeStyle = "rgba(200,150,100,0.25)"; X.lineWidth = 3;
+  for (let x = 0; x < W; x += 120) { X.beginPath(); X.moveTo(x, 0); X.lineTo(x, 860); X.stroke(); }
+  // floor
+  X.fillStyle = "#E3B78C"; X.fillRect(0, 860, W, 220);
+  X.strokeStyle = "rgba(170,120,80,0.3)";
+  for (let y = 900; y < H; y += 50) { X.beginPath(); X.moveTo(0, y); X.lineTo(W, y); X.stroke(); }
+  // rug
+  ellipse(1000, 960, 420, 70, "#F9C6D3", "rgba(200,120,140,0.3)");
+  ellipse(1000, 960, 330, 50, "#FFE0E8", null);
+  // window
+  const wx = 540, wy = 400, wr = 230;
+  circle(wx, wy, wr + 26, "#C98F65");
+  X.save(); X.beginPath(); X.arc(wx, wy, wr, 0, TAU); X.clip();
+  if (!evening) {
+    drawSky(SKY.morning);
+    drawSun(wx + 40, wy - 30, 70, t);
+    drawCloud(wx - 120 + Math.sin(t * 0.2) * 30, wy - 120, 0.6);
+    hill(wy + 170, 30, 0.01, 1, "#B4E39D");
+  } else {
+    const g = X.createLinearGradient(0, wy - wr, 0, wy + wr);
+    g.addColorStop(0, "#8E8DD0"); g.addColorStop(0.6, "#D9A3C8"); g.addColorStop(1, "#FFC9A8");
+    X.fillStyle = g; X.fillRect(wx - wr, wy - wr, wr * 2, wr * 2);
+    hill(wy + 170, 30, 0.01, 1, "#9DB6A8");
+  }
+  X.restore();
+  X.strokeStyle = "#C98F65"; X.lineWidth = 14;
+  X.beginPath(); X.moveTo(wx - wr, wy); X.lineTo(wx + wr, wy); X.moveTo(wx, wy - wr); X.lineTo(wx, wy + wr); X.stroke();
+  // curtains
+  for (const side of [-1, 1]) {
+    X.beginPath();
+    const cx0 = wx + side * (wr + 40);
+    X.moveTo(cx0 - 60 * side, 120); X.lineTo(cx0 + 30 * side, 120);
+    X.quadraticCurveTo(cx0 + 10 * side + Math.sin(t) * 4, 420, cx0 + 50 * side, 700);
+    X.lineTo(cx0 - 40 * side, 700); X.quadraticCurveTo(cx0 - 20 * side, 420, cx0 - 60 * side, 120);
+    path("#FFB8C8");
+  }
+  rrect(wx - wr - 120, 100, (wr + 120) * 2, 26, 13, "#C98F65");
+  // shelf with honey jar + plant
+  rrect(1240, 260, 380, 20, 6, "#C98F65");
+  rrect(1280, 180, 70, 80, 18, "#FFD27A"); rrect(1275, 168, 80, 22, 8, "#E8A66B"); text("honey", 1315, 228, 20, "#B4793E", { weight: 500 });
+  rrect(1420, 205, 60, 55, 10, "#F3A58E");
+  for (const [lx, ly, rr] of [[1435, 190, 18], [1460, 175, 22], [1450, 200, 16]]) circle(lx, ly, rr, "#8ED081", null);
+  rrect(1530, 150, 70, 110, 10, "#A9D8F5"); heart(1565, 205, 2.0, "#FF9FB5");
+  // hanging star mobile
+  X.strokeStyle = "rgba(150,110,80,0.6)"; X.lineWidth = 2;
+  for (let i = 0; i < 3; i++) {
+    const sx = 980 + i * 70, sy = 160 + i * 30 + Math.sin(t * 1.2 + i) * 8;
+    X.beginPath(); X.moveTo(sx, 0); X.lineTo(sx, sy - 20); X.stroke();
+    star5(sx, sy, 22, ["#FFE07A", "#C9B3F2", "#A9D8F5"][i], "rgba(180,140,60,0.3)");
+  }
+  // bed
+  rrect(1080, 600, 40, 260, 14, "#C98F65");
+  rrect(1720, 660, 34, 200, 14, "#C98F65");
+  rrect(1100, 700, 640, 110, 24, "#FFFFFF");
+  ellipse(1610, 670, 110, 50, "#FFFFFF");
+}
+function blanket(evening) {
+  X.beginPath();
+  X.moveTo(1110, 700); X.quadraticCurveTo(1300, 650, 1500, 700); X.quadraticCurveTo(1650, 690, 1735, 710);
+  X.lineTo(1745, 830); X.lineTo(1100, 830); X.closePath();
+  path(evening ? "#A9B5EC" : "#A7C7F2");
+  X.save(); X.clip();
+  for (let x = 1130; x < 1740; x += 70) for (let y = 720; y < 830; y += 50) star5(x + (y % 100 ? 35 : 0), y, 10, "rgba(255,255,255,0.7)", null);
+  X.restore();
+}
+
+S.tree_int = (t, lt, sc) => {
+  const k = clamp(lt / (sc.end - sc.start));
+  X.save();
+  const z = lerp(1.04, 1.0, smooth(k));
+  X.translate(W / 2, H / 2); X.scale(z, z); X.translate(-W / 2, -H / 2);
+  roomInterior(t, false);
+  // sunbeam
+  const sb = smooth(since(t, "sunbeam", 0.3) / 2.5);
+  if (sb > 0) {
+    X.save(); X.globalAlpha = 0.33 * sb;
+    const g = X.createLinearGradient(540, 400, 1400, 750);
+    g.addColorStop(0, "#FFF2A8"); g.addColorStop(1, "rgba(255,242,168,0)");
+    X.fillStyle = g;
+    X.beginPath(); X.moveTo(500, 200); X.lineTo(700, 250); X.lineTo(1650, 760); X.lineTo(1150, 840); X.closePath(); X.fill();
+    X.restore();
+    floatingSparkles(t, 12, 9, "#FFF7C9", 0.6 * sb, [700, 300, 900, 500]);
+  }
+  // Benny in bed
+  const wake = smooth(since(t, "wake", 0.4) / 1.2);
+  const stretch = clamp(since(t, "wake", 1.2) / 0.6) * (1 - clamp(since(t, "wake", 3.2) / 0.8));
+  const wave = smooth(since(t, "gm", 0) / 0.5) * (1 - smooth(since(t, "decide", 0) / 0.6));
+  const asleep = wake < 0.5;
+  drawBenny(1330, 790 + lerp(70, 0, wake), 1.0, {
+    t, noLegs: true, tilt: lerp(0.32, 0, wake) + (wave > 0 ? -0.05 : 0),
+    eyes: asleep ? "closed" : (stretch > 0.5 ? "happy" : undefined),
+    armsUp: smooth(stretch), wave: easeOut(wave), face: -1,
+    talk: talking(t, "B"), lookX: wave > 0.3 ? 3 : 0, seed: 1,
+  });
+  blanket(false);
+  if (asleep) zzz(t, 1400, 520, 1 - wake);
+  X.restore();
+};
+
+// ---- meadow (walk + count butterflies + smell flower) ----
+const BF_COLORS = [["#FFB3C7", "#FFD6E2"], ["#C9B3F2", "#E6DBFF"], ["#FFE07A", "#FFF0B5"], ["#A9D8F5", "#D7EEFC"], ["#FFC09F", "#FFE0CF"]];
+function walkScroll(t, intervals, speed) {
+  let d = 0;
+  for (const [a, b] of intervals) d += Math.max(0, Math.min(t, b) - a);
+  return d * speed;
+}
+function isWalking(t, intervals) { return intervals.some(([a, b]) => t >= a && t < b); }
+
+function meadowWorld(t, scroll, opts = {}) {
+  drawSky(SKY.day);
+  drawSun(1600, 180, 80, t);
+  drawClouds(t);
+  hills(scroll);
+  drawGround(900, "#9AD686");
+  if (opts.path) drawPath(scroll, 905);
+  // far flower field (parallax 0.9) & near flowers (1.0)
+  const r = rng(21);
+  for (let i = 0; i < 150; i++) {
+    const wx = i * 55 + r() * 40, gy = 900 + r() * 25, h = 25 + r() * 25, rr = 9 + r() * 5, c = PETALS[Math.floor(r() * 6)];
+    const sx = wx - scroll * 0.9;
+    if (sx > -40 && sx < W + 40) drawFlower(sx, gy, h, rr, c, "#FFD45C", Math.sin(t * 1.5 + i) * 4);
+  }
+  const r2 = rng(77);
+  for (let i = 0; i < 70; i++) {
+    const wx = i * 130 + r2() * 90, gy = 1010 + r2() * 70, h = 50 + r2() * 50, rr = 18 + r2() * 10;
+    const kind = r2();
+    const sx = wx - scroll;
+    if (sx < -80 || sx > W + 80) continue;
+    if (opts.path && kind < 0.35) drawDaisy(sx, gy, h, rr, Math.sin(t * 1.3 + i) * 6);
+    else if (opts.path && kind > 0.85) drawSunflower(sx, gy, h + 60, 34, Math.sin(t * 1.1 + i) * 5);
+    else drawFlower(sx, gy, h, rr, PETALS[Math.floor(r2() * 6)], "#FFD45C", Math.sin(t * 1.3 + i) * 6);
+  }
+}
+
+S.meadow = (t, lt, sc) => {
+  const T0 = sc.start;
+  const walkIv = [[T0 - 1, cue("bf_intro").start + 0.5], [cue("bf_done").end + 0.3, cue("smell").start + 1.6]];
+  const speed = 150;
+  const scroll = walkScroll(t, walkIv, speed);
+  const walking = isWalking(t, walkIv);
+  X.save(); zoomAt(MZ, W / 2, H);
+  meadowWorld(t, scroll);
+  // the special pink flower: placed where Benny stops
+  const stopScroll = walkScroll(walkIv[1][1] + 1, walkIv, speed);
+  const bx = 760;
+  const pinkWx = stopScroll + bx + 175;
+  const pfx = pinkWx - scroll;
+  const smellK = smooth(since(t, "smell", 1.6) / 0.8);
+  if (pfx < W + 200) {
+    drawFlower(pfx, 990, 150, 46, "#FF9FC0", "#FFD45C", Math.sin(t * 1.2) * 5, 7);
+  }
+  drawBenny(bx, 990, 0.95, {
+    t, walking, phase: scroll * 0.045,
+    lean: smellK * 0.16, eyes: smellK > 0.5 ? "happy" : undefined,
+    lookX: !walking && smellK < 0.1 ? 4 : 0, lookY: (!walking && t > cue("bf_intro").start && smellK < 0.1) ? -4 : 0,
+    talk: talking(t, "B"), seed: 2,
+  });
+  if (smellK > 0) {
+    risingHearts(t, cue("smell").start + 1.8, pfx - 10, 820, 6);
+    floatingSparkles(t, 8, 31, "#FFF2A8", 0.8 * smellK, [pfx - 150, 700, 300, 250]);
+  }
+  // butterflies
+  for (let i = 0; i < 5; i++) {
+    const c = cue("bf" + (i + 1));
+    const k = (t - c.start + 0.25) / 1.4;
+    if (k < 0) continue;
+    const homeX = 640 + i * 190, homeY = 470 + (i % 2) * 100;
+    const ex = homeX + Math.sin(t * 0.9 + i * 1.7) * 50, ey = homeY + Math.sin(t * 1.4 + i) * 30;
+    const kk = easeOut(k);
+    const x = lerp(W + 120, ex, kk), y = lerp(200 + i * 60, ey, kk) - Math.sin(kk * PI) * 120;
+    drawButterfly(x, y, 1.15, t * 9 + i, BF_COLORS[i][0], BF_COLORS[i][1], Math.sin(t * 1.3 + i) * 0.15);
+    // count bubble near butterfly, then the counter row
+    const bk = t - c.start;
+    if (bk >= 0 && bk < 1.6) {
+      const s = easeBack(bk / 0.35) * (1 - smooth((bk - 1.2) / 0.4));
+      text(String(i + 1), ex, ey - 95, 110 * s, "#FF8FA8", { outline: "#FFFFFF", outlineW: 18, alpha: clamp(s) });
+    }
+  }
+  X.restore();
+  // counter row (top left, screen space)
+  const showRow = clamp(since(t, "bf1", -0.2) / 0.5) * (1 - smooth(since(t, "smell", 0) / 0.8));
+  if (showRow > 0) {
+    X.save(); X.globalAlpha = showRow;
+    rrect(60, 50, 520, 120, 60, "rgba(255,255,255,0.8)", "rgba(255,160,180,0.5)", 4);
+    for (let i = 0; i < 5; i++) {
+      const on = t >= cue("bf" + (i + 1)).start;
+      const pop = on ? easeBack((t - cue("bf" + (i + 1)).start) / 0.35) : 0;
+      circle(130 + i * 95, 110, 36, on ? BF_COLORS[i][0] : "rgba(230,220,230,0.8)", "rgba(200,140,160,0.4)");
+      if (on) text(String(i + 1), 130 + i * 95, 112, 46 * pop, "#FFFFFF", { outline: "rgba(220,110,140,0.6)", outlineW: 8 });
+    }
+    X.restore();
+  }
+  const done = since(t, "bf_done", 0);
+  if (done > 0 && done < 3) {
+    const s = easeBack(done / 0.4) * (1 - smooth((done - 2.4) / 0.6));
+    text("5 Friendly Butterflies!", W / 2, 230, 92 * s, "#FF8FA8", { outline: "#FFFFFF", outlineW: 20, alpha: clamp(s) });
+  }
+};
+
+// ---- meeting the bunny ----
+S.bunny_meet = (t, lt, sc) => {
+  const T0 = sc.start;
+  const walkIv = [[T0 - 1, cue("see_bunny").start + 1.8]];
+  const scroll = walkScroll(t, walkIv, 140) + 3000;
+  const walking = isWalking(t, walkIv);
+  X.save(); zoomAt(MZ, W / 2, H);
+  meadowWorld(t, scroll);
+  const camBase = walkScroll(walkIv[0][1] + 1, walkIv, 140) + 3000;
+  const off = camBase - scroll; // world objects relative to final position
+  drawBush(1560 + off, 1000, 1.25);
+  drawBush(1820 + off, 1010, 0.9, "#8FD08A", "#C9B3F2");
+  const bunX = 1290 + off;
+  const looking = t < cue("hello").start;
+  const face = looking ? (Math.sin(t * 1.6) > 0 ? 1 : -1) : -1;
+  const shareK = smooth(since(t, "share", 0.2) / 1.0);
+  const offerK = smooth(since(t, "offer", 1.6) / 0.6) * (1 - shareK);
+  drawBunny(bunX, 1000, 1.25, {
+    t, face, bow: true, seed: 0.4, earPerk: t > cue("hello").start ? 1 : 0,
+    talk: talking(t, "R"), eyes: t > cue("thanks").start + 0.3 && t < cue("thanks").end ? "happy" : undefined,
+    holding: shareK > 0.95 ? "strawberry" : null,
+  });
+  drawBenny(780, 990, 0.95, {
+    t, walking, phase: scroll * 0.045, talk: talking(t, "B"), seed: 3,
+    holding: offerK > 0.02 && shareK < 0.95 ? "strawberry" : null, offer: offerK,
+    eyes: since(t, "thanks", 0.2) > 0 ? "happy" : undefined,
+    wave: smooth(since(t, "hello", 0) / 0.4) * (1 - smooth(since(t, "hello", 1.8) / 0.5)),
+  });
+  // strawberry travelling from Benny's paw to the bunny
+  if (shareK > 0 && shareK < 0.95) {
+    const sx = lerp(905, bunX + 30, shareK), sy = lerp(905, 935, shareK) - Math.sin(shareK * PI) * 60;
+    drawStrawberry(sx, sy, 1.0);
+  }
+  if (offerK > 0.2 && offerK < 1) sparkle(905, 880, 18, "#FFF2A8", offerK, t);
+  if (since(t, "share", 1.0) > 0) risingHearts(t, cue("share").start + 1.0, (780 + bunX) / 2, 800, 7);
+  X.restore();
+};
+
+// ---- walking home together & family reunion ----
+S.bunny_home = (t, lt, sc) => {
+  const T0 = sc.start;
+  const stopT = cue("family").start + 1.2;
+  const walkIv = [[T0 - 1, stopT]];
+  const speed = 160;
+  const scroll = walkScroll(t, walkIv, speed) + 6000;
+  const walking = isWalking(t, walkIv);
+  X.save(); zoomAt(MZ, W / 2, H);
+  meadowWorld(t, scroll, { path: true });
+  const stopScroll = walkScroll(stopT + 1, walkIv, speed) + 6000;
+  const off = stopScroll - scroll;
+  // big friendly oak + burrow on the right
+  const oakX = 1400 + off;
+  if (oakX < W + 500) {
+    X.fillStyle = "#A9744F";
+    X.beginPath(); X.moveTo(oakX - 80, 960); X.quadraticCurveTo(oakX - 40, 700, oakX - 50, 520); X.lineTo(oakX + 50, 520); X.quadraticCurveTo(oakX + 40, 700, oakX + 80, 960); X.closePath();
+    path("#A9744F");
+    for (const [bx, by, r, c] of [[-200, 420, 130, "#8ED081"], [0, 340, 170, "#7BC47F"], [200, 420, 140, "#A6DC8F"], [-90, 500, 120, "#A6DC8F"], [110, 500, 120, "#8ED081"]]) circle(oakX + bx, by, r, c, "rgba(70,120,60,0.22)");
+    for (const [ax, ay] of [[-120, 400], [60, 300], [150, 460], [-30, 470]]) circle(oakX + ax, ay, 12, "#FFB3A0", null);
+    ellipse(oakX, 945, 70, 42, "#7A5A44", null);
+    ellipse(oakX, 952, 56, 30, "#5E4535", null);
+    drawBush(oakX - 260, 1010, 0.8);
+  }
+  // family (mama + sibling) waiting near the oak
+  const famIn = since(t, "family", -1.0);
+  const hugK = smooth(since(t, "hug", 0) / 1.0);
+  const mamaX = oakX + 120, sibX = oakX - 120;
+  if (famIn > -2) {
+    drawBunny(mamaX, 1000, 1.55, { t, face: -1, color: "#F1E4D8", earIn: "#F7C3C9", seed: 2.1, talk: talking(t, "M"), eyes: hugK > 0.5 && hugK < 1 && t < cue("mama").start ? "happy" : undefined });
+    drawBunny(sibX, 1005, 1.0, { t, face: -1, color: "#FBEFE6", seed: 3.3, hopping: hugK > 0 && hugK < 1, phase: t * 7 });
+  }
+  // little bunny hops ahead of Benny, then into the hug
+  const bunBaseX = 960;
+  const bunX = lerp(bunBaseX, oakX + 40, hugK);
+  const hop = walking || (hugK > 0 && hugK < 1);
+  drawBunny(bunX, 1010, 1.15, {
+    t, face: 1, bow: true, hopping: hop, phase: t * 6.5, talk: talking(t, "R"), seed: 0.4,
+    eyes: hugK > 0.9 ? "happy" : undefined,
+  });
+  drawBenny(640, 990, 0.95, {
+    t, walking, phase: scroll * 0.045, seed: 4, talk: talking(t, "B"),
+    eyes: since(t, "warm", 0.3) > 0 ? "happy" : undefined,
+    wave: smooth(since(t, "mama", 1.0) / 0.5) * (1 - smooth(since(t, "warm", 0.5) / 0.5)),
+  });
+  if (hugK > 0.6) risingHearts(t, cue("hug").start + 0.8, oakX + 40, 820, 9, "#FF9FB5", 220);
+  if (since(t, "warm", 0) > 0) {
+    risingHearts(t, cue("warm").start, 640, 700, 8, "#FFB3C7", 160);
+    X.save(); X.globalAlpha = 0.25 * smooth(since(t, "warm", 0) / 1.2);
+    const g = X.createRadialGradient(640, 800, 20, 640, 800, 320);
+    g.addColorStop(0, "#FFE7A8"); g.addColorStop(1, "rgba(255,231,168,0)");
+    X.fillStyle = g; X.fillRect(220, 400, 840, 680);
+    X.restore();
+  }
+  X.restore();
+};
+
+S.sunset_ext = (t, lt, sc) => {
+  const dur = sc.end - sc.start;
+  const k = clamp(lt / dur);
+  drawSky(SKY.sunset);
+  floatingSparkles(t, 10, 51, "#FFF6E0", 0.5, [0, 0, W, 500]);
+  drawSun(420, lerp(560, 720, k), 95, t, { fill: "#FFC46B", ray: "#FFD49A", glow: "rgba(255,200,140,0.7)" });
+  drawClouds(t * 0.6, "#FFE3EA", 0.85);
+  hills(t * 2, 0.35);
+  drawGround(900, "#A8CF86");
+  drawTree(1060, 905, t, ["#9CC98A", "#8DBE84", "#B2D592"]);
+  drawTreehouse(1060, 560, t, { groundY: 905, windowFill: "#FFE7A3", wall: "#F4C08A" });
+  // Benny walks home to the ladder
+  const walkEnd = sc.start + dur - 1.0;
+  const bx = lerp(150, 880, clamp((t - sc.start) / (walkEnd - sc.start)));
+  const walking = t < walkEnd;
+  drawBenny(bx, 985, 0.8, { t, walking, phase: t * 6.5, seed: 5, eyes: "happy" });
+  for (let i = 0; i < 4; i++) {
+    const kk = ((t * 0.5 + i / 4) % 1);
+    musicNote(bx + 60 + kk * 90, 700 - kk * 160, 1.1, ["#FF9FB5", "#C9B3F2", "#8ED6C4", "#FFC09F"][i], Math.sin(kk * PI));
+  }
+  const r = rng(5);
+  for (let i = 0; i < 30; i++) drawFlower(r() * W, 930 + r() * 130, 30 + r() * 30, 15 + r() * 8, PETALS[i % 6], "#FFD45C", Math.sin(t * 1.3 + i) * 5);
+  // warm sunset overlay
+  X.fillStyle = "rgba(255,170,120,0.10)"; X.fillRect(0, 0, W, H);
+};
+
+S.sunset_int = (t, lt, sc) => {
+  roomInterior(t, true);
+  // twinkling stars + crescent moon in window
+  X.save(); X.beginPath(); X.arc(540, 400, 230, 0, TAU); X.clip();
+  const sK = smooth(since(t, "stars", 0.4) / 2.5);
+  const r = rng(91);
+  for (let i = 0; i < 14; i++) {
+    const sx = 340 + r() * 400, sy = 200 + r() * 220, ph = r() * TAU;
+    const a = sK * (0.55 + 0.45 * Math.sin(t * 2.2 + ph)) * clamp((sK * 14 - i) / 1);
+    X.globalAlpha = Math.max(0, a); star5(sx, sy, 9 + r() * 6, "#FFF4B8", null); X.globalAlpha = 1;
+  }
+  circle(650, 280, 46, "#FFF4C9", null);
+  circle(672, 266, 40, "#B49ACF", null);
+  X.restore();
+  // lamp glow
+  const g = X.createRadialGradient(1600, 420, 30, 1600, 420, 650);
+  g.addColorStop(0, "rgba(255,214,150,0.45)"); g.addColorStop(1, "rgba(255,214,150,0)");
+  X.fillStyle = g; X.fillRect(0, 0, W, H);
+  rrect(1580, 430, 40, 230, 10, "#C98F65");
+  X.beginPath(); X.moveTo(1520, 430); X.lineTo(1680, 430); X.lineTo(1640, 330); X.lineTo(1560, 330); X.closePath(); path("#FFD9A0");
+  drawBenny(1250, 790, 1.0, { t, noLegs: true, face: -1, tilt: -0.05, talk: talking(t, "B"), lookX: 3, lookY: -3, seed: 6, eyes: since(t, "reflect", 0) > 3 ? "happy" : undefined });
+  blanket(true);
+};
+
+S.ending = (t, lt, sc) => {
+  const g = X.createRadialGradient(W / 2, H / 2, 100, W / 2, H / 2, 1100);
+  g.addColorStop(0, "#FFF4E6"); g.addColorStop(0.6, "#FDE1EA"); g.addColorStop(1, "#E3DDF8");
+  X.fillStyle = g; X.fillRect(0, 0, W, H);
+  floatingSparkles(t, 30, 61, "#FFFFFF", 0.9);
+  const r = rng(3);
+  for (let i = 0; i < 12; i++) {
+    const x = r() * W, y = ((r() * H - t * (20 + r() * 20)) % H + H) % H;
+    heart(x, y, 1.6 + r() * 1.4, ["#FFC2D1", "#D9CCFA", "#BFE7F2"][i % 3], 0.65);
+  }
+  const k1 = easeBack(since(t, "end1", -0.2) / 0.6);
+  const k2 = easeBack(since(t, "end2", -0.1) / 0.5);
+  drawBenny(W / 2, 1060, 1.55, { t, wave: 1, talk: talking(t, "B"), seed: 7, eyes: t > cue("end2").end + 0.3 ? "happy" : undefined });
+  X.save(); X.translate(W / 2, 150); X.scale(clamp(k1, 0, 2), clamp(k1, 0, 2));
+  text("Keep smiling, keep learning,", 0, -10, 78, "#FF8FA8", { outline: "#FFFFFF", outlineW: 18, alpha: clamp(k1) });
+  text("and remember to be kind!", 0, 85, 78, "#6FB7C9", { outline: "#FFFFFF", outlineW: 18, alpha: clamp(k1) });
+  X.restore();
+  if (k2 > 0) {
+    X.save(); X.translate(1500, 560); X.rotate(0.06); X.scale(k2, k2);
+    rrect(-275, -70, 550, 140, 70, "#FFFFFF", "rgba(255,150,170,0.6)", 5);
+    text("See you next time!", 0, 4, 54, "#FF8FA8");
+    X.restore();
+    X.save(); X.translate(420, 560); X.rotate(-0.06); X.scale(k2, k2);
+    rrect(-200, -70, 400, 140, 70, "#FFFFFF", "rgba(120,190,210,0.6)", 5);
+    text("Be kind!", -30, 4, 54, "#6FB7C9");
+    heart(120, 12, 2.6, "#FF9FB5");
+    X.restore();
+  }
+};
+
+// ============================================================ compositor ==
+function sceneAt(t) { return TL.scenes.findIndex((s) => t >= s.start && t < s.end); }
+function drawScene(i, t, c) {
+  const sc = TL.scenes[i];
+  X = c;
+  c.save();
+  S[sc.id](t, t - sc.start, sc);
+  c.restore();
+  X = ctx;
+}
+window.renderFrame = function (t) {
+  const n = TL.scenes.length;
+  let i = sceneAt(t);
+  if (i < 0) i = t < 0 ? 0 : n - 1;
+  const sc = TL.scenes[i];
+  const half = TL.xfade / 2;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1;
+  // crossfade window around each boundary
+  if (i > 0 && t - sc.start < half) {
+    const k = smooth((t - sc.start + half) / TL.xfade);
+    drawScene(i - 1, t, ctx);
+    octx.setTransform(1, 0, 0, 1, 0, 0); octx.globalAlpha = 1;
+    drawScene(i, t, octx);
+    ctx.globalAlpha = k; ctx.drawImage(off, 0, 0); ctx.globalAlpha = 1;
+  } else if (i < n - 1 && sc.end - t < half) {
+    const k = smooth((t - (sc.end - half)) / TL.xfade);
+    drawScene(i, t, ctx);
+    octx.setTransform(1, 0, 0, 1, 0, 0); octx.globalAlpha = 1;
+    drawScene(i + 1, t, octx);
+    ctx.globalAlpha = k; ctx.drawImage(off, 0, 0); ctx.globalAlpha = 1;
+  } else {
+    drawScene(i, t, ctx);
+  }
+  // gentle fade from / to warm cream at the very start and end
+  const fin = 1 - smooth(t / 0.9), fout = smooth((t - (TL.total - 1.6)) / 1.6);
+  const fa = Math.max(fin, fout);
+  if (fa > 0) { ctx.globalAlpha = fa; ctx.fillStyle = "#FFF6EA"; ctx.fillRect(0, 0, W, H); ctx.globalAlpha = 1; }
+  return true;
+};
+window.setTimeline = function (tl) { TL = tl; };
+window.fontsReady = () => document.fonts.load('600 40px Fredoka').then(() => document.fonts.load('500 40px Fredoka')).then(() => true);
+</script>
+</body>
+</html>
