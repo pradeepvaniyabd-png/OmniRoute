@@ -1,0 +1,18 @@
+[theme]
+base = "dark"
+primaryColor = "#22d3ee"
+backgroundColor = "#0b0f17"
+secondaryBackgroundColor = "#111827"
+textColor = "#e5e7eb"
+
+[server]
+headless = true
+runOnSave = false
+# Hot-reload is disabled so code edits never spawn a second trading worker.
+fileWatcherType = "none"
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
