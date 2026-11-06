@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark light">
+  <meta name="theme-color" content="#090c12">
+  <meta name="robots" content="noindex">
+  <title>Sign in · Quant Super-Terminal</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="preload" href="/fonts/inter-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/assets/css/app.css?v=__APP_VERSION__">
+  <script src="/assets/js/theme-init.js?v=__APP_VERSION__"></script>
+  <script type="module" src="/assets/js/login.js?v=__APP_VERSION__"></script>
+</head>
+<body>
+  <main class="auth">
+    <div class="auth-bg"></div>
+    <svg class="auth-candles" width="520" height="360" viewBox="0 0 520 360" fill="none" stroke="currentColor" stroke-width="3" aria-hidden="true">
+      <path d="M40 120v40M40 240v60M100 80v50M100 210v70M160 140v30M160 250v50M220 60v40M220 190v60M280 100v40M280 220v40M340 40v40M340 160v60M400 70v30M400 180v50M460 20v40M460 140v60"/>
+      <rect x="28" y="160" width="24" height="80" rx="4"/><rect x="88" y="130" width="24" height="80" rx="4"/><rect x="148" y="170" width="24" height="80" rx="4"/>
+      <rect x="208" y="100" width="24" height="90" rx="4"/><rect x="268" y="140" width="24" height="80" rx="4"/><rect x="328" y="80" width="24" height="80" rx="4"/>
+      <rect x="388" y="100" width="24" height="80" rx="4"/><rect x="448" y="60" width="24" height="80" rx="4"/>
+    </svg>
+    <form class="auth-card" id="login-form" novalidate>
+      <div class="auth-brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M6.5 4v3M6.5 15v5M12 3v4M12 13v8M17.5 6v3M17.5 16v3"/><rect x="4.5" y="7" width="4" height="8" rx="1"/><rect x="10" y="7" width="4" height="6" rx="1"/><rect x="15.5" y="9" width="4" height="7" rx="1"/></svg>
+        </span>
+        <span class="brand-text"><span class="brand-name">Quant Super-Terminal</span><span class="brand-tag">SMC · ICT · Algo Execution</span></span>
+      </div>
+      <div>
+        <h1 class="auth-title">Sign in</h1>
+        <p class="auth-sub">Enter the terminal password set in <span class="mono">WEB_PASSWORD</span>.</p>
+      </div>
+      <div class="auth-error" id="login-error" role="alert" hidden></div>
+      <div class="field">
+        <label class="field-label" for="password">Password</label>
+        <div class="pw-wrap">
+          <input class="input" id="password" name="password" type="password" autocomplete="current-password" required autofocus>
+          <button class="icon-btn pw-toggle" id="pw-toggle" type="button" aria-label="Show password">
+            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg>
+          </button>
+        </div>
+      </div>
+      <button class="btn btn-primary btn-lg btn-block" id="login-submit" type="submit">Sign in</button>
+      <div class="auth-foot">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/></svg>
+        Encrypted session · HttpOnly cookie · auto-lock after repeated failures
+      </div>
+    </form>
+  </main>
+</body>
+</html>

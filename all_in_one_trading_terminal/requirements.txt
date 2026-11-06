@@ -1,0 +1,31 @@
+# =============================================================================
+# All-in-One Forex & Crypto Algorithmic Trading Super-Terminal
+# Runtime dependencies — Python 3.11 / 3.12 / 3.13 (64-bit)
+# =============================================================================
+
+# MetaTrader 5 bridge — official package ships Windows wheels only.
+# On macOS/Linux the terminal still runs in BROKER_MODE=paper.
+MetaTrader5>=5.0.4424; sys_platform == "win32"
+
+# Data / maths
+pandas>=2.2
+numpy>=1.26
+
+# Web terminal (FastAPI REST + WebSocket live feed)
+fastapi>=0.115,<1.0
+uvicorn>=0.30
+websockets>=13
+
+# Classic dashboard (run_terminal.bat classic)
+streamlit>=1.50
+streamlit-lightweight-charts>=0.7.20
+
+# Networking (Telegram async client, Forex Factory feed, public market data)
+httpx>=0.27,<1.0
+beautifulsoup4>=4.12
+
+# Configuration
+python-dotenv>=1.0
+
+# IANA time-zone database (required on Windows for zoneinfo: Asia/Kolkata, America/New_York)
+tzdata>=2024.1
