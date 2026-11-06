@@ -276,6 +276,7 @@ class TradingWorker:
         self._orders_cache: list[PendingOrderInfo] = []
         self._account_cache: AccountInfo | None = None
         self._last_equity_log = 0.0
+        self._last_quote_refresh = 0.0
         self._startup_reconciled = False
         self._state: dict[str, Any] = {
             "started_at": None, "mode": "PAPER" if settings.broker_mode == "paper" else "MT5",
@@ -486,9 +487,8 @@ class TradingWorker:
         tick = broker.get_tick(symbol)
         spec = broker.get_symbol_spec(symbol)
         if tick is not None and spec is not None:
-            self._set_symbol_state(canonical, broker_symbol=symbol, bid=tick.bid, ask=tick.ask,
-                                   spread_points=round(tick.spread_points(spec.point), 1),
-                                   digits=spec.digits, tick_time=tick.time_utc.isoformat())
+            self._store_quote(canonical, symbol, tick, spec)
+        self._set_symbol_state(canonical, change_24h_pct=self._change_24h(ltf))
         closed = closed_bars(prepare_ohlcv(ltf), s.ltf, now)
         if closed.empty or self._last_analyzed.get(canonical) == closed.index[-1]:
             return
@@ -506,6 +506,35 @@ class TradingWorker:
                                last_analysis_at=now.isoformat(timespec="seconds"))
         for trade_signal in analysis.signals:
             self._handle_signal(trade_signal, symbol, spec, tick, now)
+
+    def _store_quote(self, canonical: str, symbol: str, tick: Tick, spec: SymbolSpec) -> None:
+        self._set_symbol_state(canonical, broker_symbol=symbol, bid=tick.bid, ask=tick.ask,
+                               spread_points=round(tick.spread_points(spec.point), 1),
+                               digits=spec.digits, tick_time=tick.time_utc.isoformat())
+
+    def _refresh_quotes(self, min_interval: float = 2.0) -> None:
+        """Keep market-watch quotes live between scans (cheap: ticks are cached by the broker)."""
+        if self.broker is None or time.monotonic() - self._last_quote_refresh < min_interval:
+            return
+        self._last_quote_refresh = time.monotonic()
+        for canonical in self.settings.symbols:
+            symbol = self._broker_symbol(canonical)
+            if not symbol:
+                continue
+            tick, spec = self.broker.get_tick(symbol), self.broker.get_symbol_spec(symbol)
+            if tick is not None and spec is not None:
+                self._store_quote(canonical, symbol, tick, spec)
+
+    @staticmethod
+    def _change_24h(frame: pd.DataFrame) -> float | None:
+        """Percent change of the last close versus the close 24 hours earlier."""
+        if frame is None or frame.empty:
+            return None
+        closes = frame["close"]
+        prior = closes[closes.index <= closes.index[-1] - pd.Timedelta(hours=24)]
+        if prior.empty or not float(prior.iloc[-1]):
+            return None
+        return round((float(closes.iloc[-1]) / float(prior.iloc[-1]) - 1.0) * 100.0, 3)
 
     def _dxy_frame(self, broker: BrokerAdapter) -> pd.DataFrame | None:
         stamp, frame = self._dxy_cache
@@ -781,10 +810,14 @@ class TradingWorker:
                         "tp1_hit": bool(managed and managed.tp1_hit),
                         "trailing": bool(managed and managed.trailing_active)})
             rows.append(row)
-        self._set_state(account=account.to_dict(), drawdown=drawdown.to_dict(), positions=rows,
+        drawdown_state = drawdown.to_dict()
+        drawdown_state["realized_today"] = round(
+            self.db.realized_pnl_since(self.dd_guard.day_start_utc(now), broker.mode), 2)
+        self._set_state(account=account.to_dict(), drawdown=drawdown_state, positions=rows,
                         orders=[o.to_dict() for o in orders],
                         last_protect_at=now.isoformat(timespec="seconds"))
         self._update_bot_status()
+        self._refresh_quotes()
 
     def _trigger_circuit_breaker(self, drawdown: DrawdownStatus, account: AccountInfo) -> None:
         broker = self.broker

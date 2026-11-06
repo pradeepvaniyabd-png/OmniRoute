@@ -8,6 +8,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import httpx
+import pandas as pd
 import pytest
 from conftest import FakeFeed, bullish_frame, floor_time, trend_frame
 
@@ -68,8 +69,14 @@ def flush(worker: TradingWorker) -> None:
 def test_full_trade_lifecycle(rig):
     worker, feed, recorder = rig
     worker._protect_cycle()
-    assert worker.get_snapshot()["bot_status"] == "RUNNING"
+    snapshot = worker.get_snapshot()
+    assert snapshot["bot_status"] == "RUNNING"
+    quote = snapshot["symbols"]["XAUUSD"]  # market-watch quotes refresh from the protector loop
+    assert quote["bid"] == pytest.approx(2000.4) and quote["ask"] == pytest.approx(2000.6)
+    assert quote["spread_points"] == pytest.approx(20.0) and quote["digits"] == 2
+    assert snapshot["drawdown"]["realized_today"] == 0.0
     worker._scan_cycle()
+    assert "change_24h_pct" in worker.get_snapshot()["symbols"]["XAUUSD"]
     trades = worker.db.get_trades()
     assert len(trades) == 1, worker.db.get_recent_signals()
     trade = trades[0]
@@ -102,6 +109,7 @@ def test_full_trade_lifecycle(rig):
     assert any("TP1 HIT" in t for t in texts)
     assert any("TRAILING STOP ACTIVATED" in t or "BREAKEVEN" in t for t in texts)
     assert any("CLOSED AT PROTECTED STOP" in t for t in texts)
+    assert worker.get_snapshot()["drawdown"]["realized_today"] == pytest.approx(trade["pnl"])
     signal_card_id = trade["telegram_message_id"]
     assert signal_card_id and any(m.get("reply_parameters", {}).get("message_id") == signal_card_id
                                   for m in recorder.messages)
@@ -185,6 +193,15 @@ def test_panic_close_and_manual_controls(rig):
     worker._protect_cycle()
     assert worker.db.get_trade_by_position(first["ticket"])["close_reason"] == "PANIC"
     assert worker.runtime.bot_enabled is False
+
+
+def test_change_24h_from_ltf_closes():
+    index = pd.date_range("2026-11-04 00:00", periods=300, freq="5min", tz="UTC")
+    closes = pd.Series(range(300), index=index, dtype=float) + 100.0
+    frame = pd.DataFrame({"open": closes, "high": closes, "low": closes, "close": closes})
+    expected = (399.0 / 111.0 - 1.0) * 100.0  # close exactly 24h (288 bars) before the last bar
+    assert TradingWorker._change_24h(frame) == pytest.approx(expected, abs=1e-3)
+    assert TradingWorker._change_24h(frame.tail(10)) is None
 
 
 def test_single_instance_lock(tmp_path):
