@@ -558,6 +558,13 @@ class Database:
         rows.reverse()
         return rows
 
+    def purge_mode_history(self, mode: str) -> dict[str, int]:
+        """Delete one broker mode's trade journal and equity curve (paper-account reset)."""
+        with self.transaction() as conn:
+            trades = conn.execute("DELETE FROM trades WHERE mode = ?", (mode,)).rowcount
+            equity = conn.execute("DELETE FROM equity_log WHERE mode = ?", (mode,)).rowcount
+        return {"trades": int(trades), "equity_points": int(equity)}
+
     def prune_equity(self, days: int = 120) -> int:
         cutoff = to_iso(datetime.now(UTC) - timedelta(days=days))
         return self._execute("DELETE FROM equity_log WHERE ts < ?", (cutoff,)).rowcount

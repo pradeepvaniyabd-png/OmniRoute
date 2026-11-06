@@ -1763,6 +1763,14 @@ class DailyDrawdownGuard:
                               round(drawdown, 2), round(drawdown_pct, 3), limit,
                               drawdown_pct >= limit, bool(row.get("halted")), row.get("halt_reason"))
 
+    def rebase(self, account: AccountInfo, now: datetime | None = None) -> None:
+        """Restart today's baseline from the current account (after a paper-account reset)."""
+        day = self.trading_day(now or datetime.now(UTC))
+        self.db.upsert_daily_stats(day, start_equity=account.equity, start_balance=account.balance,
+                                   min_equity=account.equity, max_drawdown_pct=0.0, halted=False,
+                                   halted_at=None, halt_reason=None)
+        self._last_write = 0.0
+
     def halt(self, trading_day: str, reason: str) -> None:
         self.db.upsert_daily_stats(trading_day, halted=True, halted_at=datetime.now(UTC),
                                    halt_reason=reason)

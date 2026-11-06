@@ -84,7 +84,7 @@ def test_full_trade_lifecycle(rig):
     assert trade["entry_price"] == pytest.approx(2000.2) and trade["volume"] > 0
     assert worker.db.get_recent_signals()[0]["status"] == "EXECUTED"
     flush(worker)
-    assert any("TRADE EXECUTED" in t and "BUY XAUUSD" in t for t in recorder.texts())
+    assert any("ORDER PLACED" in t and "BUY XAUUSD" in t and "(Limit order)" in t for t in recorder.texts())
 
     feed.mid = 2000.0  # ask 2000.10 <= limit 2000.20 -> fill
     worker._protect_cycle()
@@ -213,3 +213,100 @@ def test_single_instance_lock(tmp_path):
     second = SingleInstanceLock(tmp_path / "worker.lock")
     second.acquire()
     second.release()
+
+
+def test_manual_limit_stop_orders_modify_cancel_and_event_feed(rig):
+    worker, feed, recorder = rig
+    feed.mid = 2000.0
+    worker._protect_cycle()
+    assert any(e["title"] == "Broker connected" for e in worker.events_since(0))
+    wrong_side = worker.preview_manual_trade("XAUUSD", "BUY", 0.5, "pips", 50, order_kind="LIMIT",
+                                             entry_price=2005.0)
+    assert not wrong_side["ok"] and "below" in wrong_side["error"]
+    no_price = worker.preview_manual_trade("XAUUSD", "SELL", 0.5, "pips", 50, order_kind="STOP")
+    assert not no_price["ok"] and "price" in no_price["error"]
+    assert not worker.preview_manual_trade("XAUUSD", "HOLD", 0.5, "pips", 50)["ok"]
+    preview = worker.preview_manual_trade("XAUUSD", "BUY", 0.5, "pips", 50, order_kind="LIMIT",
+                                          entry_price=1995.0)
+    assert preview["ok"] and preview["entry"] == 1995.0 and preview["sl"] == pytest.approx(1990.0)
+    assert preview["market_price"] == pytest.approx(2000.1) and preview["order_kind"] == "LIMIT"
+
+    limit = worker.manual_trade("XAUUSD", "BUY", 0.5, "pips", 50, order_kind="LIMIT", entry_price=1995.0)
+    assert limit["ok"] and limit["pending"], limit
+    journal = worker.db.get_trade_by_order(limit["order_ticket"])
+    assert journal["status"] == "PENDING" and journal["order_type"] == "LIMIT"
+    worker._protect_cycle()
+    assert worker.db.get_trade_by_order(limit["order_ticket"])["status"] == "PENDING"
+    assert worker.cancel_order_manual(limit["order_ticket"])["ok"]
+    assert worker.db.get_trade_by_order(limit["order_ticket"])["status"] == "CANCELLED"
+    assert not worker.cancel_order_manual(limit["order_ticket"])["ok"]  # already gone
+
+    stop = worker.manual_trade("XAUUSD", "SELL", 0.5, "pips", 50, order_kind="STOP", entry_price=1990.0)
+    assert stop["ok"], stop
+    feed.mid = 1989.0
+    worker._protect_cycle()
+    filled = worker.db.get_trade_by_order(stop["order_ticket"])
+    assert filled["status"] == "OPEN" and filled["position_ticket"]
+    ticket = int(filled["position_ticket"])
+    assert worker.modify_position_manual(ticket, sl=1994.0, tp=1970.0)["ok"]
+    position = next(p for p in worker.broker.get_positions() if p.ticket == ticket)
+    assert position.sl == pytest.approx(1994.0) and position.tp == pytest.approx(1970.0)
+    updated = worker.db.get_trade(filled["id"])
+    assert updated["sl_current"] == pytest.approx(1994.0) and updated["tp2"] == pytest.approx(1970.0)
+    assert not worker.modify_position_manual(ticket)["ok"]
+    assert not worker.modify_position_manual(ticket, sl=-1.0)["ok"]
+
+    titles = [e["title"] for e in worker.events_since(0)]
+    assert any(t.startswith("BUY LIMIT placed") for t in titles)
+    assert any(t.startswith("Order cancelled") for t in titles)
+    assert any(t.startswith("Order filled") for t in titles)
+    assert any(t.startswith("Stops updated") for t in titles)
+    last = worker.last_event_id
+    assert worker.events_since(last) == [] and worker.get_snapshot()["last_event_id"] == last
+    assert [e["id"] for e in worker.events_since(0, limit=2)] == [last - 1, last]
+    flush(worker)
+    texts = recorder.texts()
+    assert any("ORDER PLACED" in text and "(Stop order)" in text for text in texts), texts
+    assert any("ENTRY TRIGGERED" in text for text in texts), texts
+
+
+def test_web_tools_specs_sparklines_correlation_volatility(rig):
+    worker, _feed, _recorder = rig
+    worker._protect_cycle()
+    worker._scan_cycle()
+    specs = worker.symbol_specs()
+    row = specs["symbols"][0]
+    assert specs["account_currency"] and specs["leverage"] == 100
+    assert row["available"] and row["symbol"] == "XAUUSD" and row["digits"] == 2
+    assert row["pip"] == pytest.approx(0.1) and row["pip_value"] > 0
+    assert row["margin_per_lot"] == pytest.approx(row["notional_per_lot"] / 100)
+    assert len(worker.sparklines()["XAUUSD"]) > 2
+    corr = worker.correlation("H1", 50)
+    assert corr["symbols"] == ["XAUUSD"] and corr["matrix"] == [[1.0]] and corr["timeframe"] == "H1"
+    assert worker.correlation("H1", 50) is corr  # cached
+    vol = worker.volatility()
+    assert vol[0]["symbol"] == "XAUUSD" and vol[0]["digits"] == 2 and vol[0]["atr_ltf"] is not None
+    json.dumps({"specs": specs, "corr": corr, "vol": vol})
+
+
+def test_paper_account_reset(rig):
+    worker, feed, _recorder = rig
+    feed.mid = 2000.0
+    worker._protect_cycle()
+    opened = worker.manual_trade("XAUUSD", "BUY", 0.5, "atr", 1.5)
+    assert opened["ok"], opened
+    worker._protect_cycle()
+    with pytest.raises(TypeError):
+        worker.reset_paper_account(1000.0, True, "extra")  # signature guard
+    assert not worker.reset_paper_account(-5)["ok"]
+    reset = worker.reset_paper_account(5000.0)
+    assert reset["ok"] and reset["balance"] == pytest.approx(5000.0)
+    assert worker.broker.get_positions() == []
+    assert worker.db.get_trade_by_position(opened["ticket"])["status"] == "CANCELLED"
+    worker._protect_cycle()
+    snapshot = worker.get_snapshot()
+    assert snapshot["account"]["balance"] == pytest.approx(5000.0)
+    assert snapshot["drawdown"]["drawdown_pct"] == 0.0 and not snapshot["drawdown"]["halted"]
+    wiped = worker.reset_paper_account(clear_history=True)
+    assert wiped["ok"] and wiped["trades"] >= 1 and worker.db.get_trades() == []
+    assert any(e["title"] == "Paper account reset" for e in worker.events_since(0))

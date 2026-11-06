@@ -135,6 +135,10 @@ def format_trade_signal(sig: Mapping[str, Any], brand: str = "", mode: str = "",
     order_type = str(sig.get("order_type", "MARKET")).upper()
     entry_label = "Market" if order_type == "MARKET" else f"{order_type.title()} order"
     executed = str(sig.get("status", "SIGNAL")).upper() == "EXECUTED"
+    if executed:
+        badge = "⚡ TRADE EXECUTED" if order_type == "MARKET" else "⏳ ORDER PLACED"
+    else:
+        badge = "📡 A+ SETUP ALERT"
 
     def pips(distance: float) -> str:
         return f" ({distance / pip:,.1f} pips)" if pip > 0 else ""
@@ -144,7 +148,7 @@ def format_trade_signal(sig: Mapping[str, Any], brand: str = "", mode: str = "",
         lines.append("🧪 <b>TEST SIGNAL — NOT A LIVE TRADE</b>")
     lines += [
         f"{'🟢' if is_buy else '🔴'} <b>{esc(direction)} {esc(sig.get('symbol'))}</b>  ·  "
-        f"{'⚡ TRADE EXECUTED' if executed else '📡 A+ SETUP ALERT'}",
+        f"{badge}",
         f"<i>{esc(sig.get('strategy', 'Algorithmic Setup'))}</i>  ·  {esc(sig.get('timeframe', ''))}",
         DIVIDER,
         f"📍 <b>Entry:</b> <code>{fmt_price(entry, digits)}</code> ({esc(entry_label)})",

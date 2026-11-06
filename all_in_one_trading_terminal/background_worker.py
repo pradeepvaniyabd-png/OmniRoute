@@ -39,6 +39,7 @@ from typing import Any, Callable
 
 import pandas as pd
 
+from analytics import correlation_matrix, volatility_row
 from config import (
     IST,
     STRATEGY_CODES,
@@ -278,6 +279,11 @@ class TradingWorker:
         self._last_equity_log = 0.0
         self._last_quote_refresh = 0.0
         self._startup_reconciled = False
+        self._events: deque[dict[str, Any]] = deque(maxlen=400)
+        self._event_seq = 0
+        self._event_lock = threading.Lock()
+        self._was_connected: bool | None = None
+        self._tool_cache: dict[tuple[Any, ...], tuple[float, Any]] = {}
         self._state: dict[str, Any] = {
             "started_at": None, "mode": "PAPER" if settings.broker_mode == "paper" else "MT5",
             "broker_connected": False, "broker_error": None, "ping_ms": None, "account": None,
@@ -303,6 +309,29 @@ class TradingWorker:
     def _set_symbol_state(self, canonical: str, **values: Any) -> None:
         with self._state_lock:
             self._state["symbols"].setdefault(canonical, {}).update(values)
+
+    def _emit(self, kind: str, title: str, detail: str = "", level: str = "info",
+              symbol: str | None = None) -> None:
+        """Queue a user-facing notification (web bell, toasts). Never raises."""
+        try:
+            with self._event_lock:
+                self._event_seq += 1
+                self._events.append({"id": self._event_seq,
+                                     "ts": utc_now().isoformat(timespec="seconds"),
+                                     "kind": kind, "level": level, "title": title,
+                                     "detail": detail, "symbol": symbol})
+        except Exception:  # noqa: BLE001 - notifications must never interrupt trading
+            log.debug("event emit failed", exc_info=True)
+
+    @property
+    def last_event_id(self) -> int:
+        with self._event_lock:
+            return self._event_seq
+
+    def events_since(self, last_id: int = 0, limit: int = 100) -> list[dict[str, Any]]:
+        with self._event_lock:
+            items = [dict(event) for event in self._events if event["id"] > int(last_id)]
+        return items[-max(1, int(limit)):]
 
     def _log_throttled(self, key: str, level: int, message: str, *args: Any,
                        interval: float = 60.0) -> None:
@@ -562,6 +591,9 @@ class TradingWorker:
             log.info("Setup detected: %s %s %s [%s] entry %.5g SL %.5g score %.1f (%s)", sig.symbol,
                      sig.direction, sig.strategy, sig.order_type, sig.entry, sig.stop_loss,
                      sig.score, sig.grade)
+            if str(sig.grade).upper() in ("A+", "A"):
+                self._emit("signal", f"{sig.grade} {sig.direction} setup — {sig.symbol}",
+                           f"{sig.strategy} · score {sig.score:.1f}", "info", sig.symbol)
         decision = self._gate_signal(sig, symbol, spec, tick, now)
         if decision is not None:
             status, reason = decision
@@ -721,9 +753,13 @@ class TradingWorker:
         log.info("EXECUTED %s %s %s %.2f lots @ %.5g (SL %.5g TP1 %.5g TP2 %.5g) risk %.2f%%",
                  sig.order_type, sig.direction, sig.symbol, size.lots, fill_price, sig.stop_loss,
                  tp1, tp2, size.actual_risk_percent)
+        self._emit("trade", f"{'Executed' if market else 'Order placed'} {sig.direction} {sig.symbol}",
+                   f"{'MARKET' if market else 'LIMIT'} {size.lots:g} lots @ {fill_price:.{spec.digits}f} · "
+                   f"risk {size.actual_risk_percent:.2f}%", "success" if market else "info", sig.symbol)
         if self.settings.telegram.broadcast_executed:
             payload = self._signal_payload(sig, spec, entry=fill_price if market else entry, tp1=tp1,
-                                           tp2=tp2, order_type=sig.order_type, status="EXECUTED",
+                                           tp2=tp2, order_type="MARKET" if market else "LIMIT",
+                                           status="EXECUTED",
                                            lots=size.lots, risk_percent=size.actual_risk_percent,
                                            risk_amount=size.actual_risk)
             self.telegram.broadcast_trade_signal(
@@ -769,6 +805,13 @@ class TradingWorker:
         connected = broker.ensure_connected()
         self._set_state(broker_connected=connected, ping_ms=broker.ping_ms() if connected else None,
                         broker_error=None if connected else (broker.last_error or "broker offline"))
+        if connected != self._was_connected:
+            if connected:
+                self._emit("broker", "Broker connected", f"{broker.mode} account online", "success")
+            else:
+                self._emit("broker", "Broker disconnected",
+                           broker.last_error or "connection lost — reconnecting", "danger")
+            self._was_connected = connected
         if not connected:
             self._update_bot_status()
             return
@@ -814,7 +857,7 @@ class TradingWorker:
         drawdown_state["realized_today"] = round(
             self.db.realized_pnl_since(self.dd_guard.day_start_utc(now), broker.mode), 2)
         self._set_state(account=account.to_dict(), drawdown=drawdown_state, positions=rows,
-                        orders=[o.to_dict() for o in orders],
+                        orders=[{**o.to_dict(), "canonical": self._canonical_for(o.symbol)} for o in orders],
                         last_protect_at=now.isoformat(timespec="seconds"))
         self._update_bot_status()
         self._refresh_quotes()
@@ -825,6 +868,7 @@ class TradingWorker:
         reason = (f"Daily loss {drawdown.drawdown_pct:.2f}% reached the "
                   f"{drawdown.limit_pct:.2f}% limit")
         log.critical("CIRCUIT BREAKER: %s — closing exposure and halting until next trading day", reason)
+        self._emit("risk", "Circuit breaker triggered", f"{reason} — trading halted for the day", "danger")
         self.dd_guard.halt(drawdown.trading_day, reason)
         magic = None if self.settings.risk.circuit_breaker_scope == "all" else self.settings.mt5.magic
         cancelled = closed = failed = 0
@@ -901,7 +945,10 @@ class TradingWorker:
                                              closed_at=now, notes="limit order expired unfilled")
                         log.info("Pending %s %s #%s expired and was cancelled", trade["symbol"],
                                  trade["direction"], ticket)
-                        self.telegram.broadcast_trade_update("PENDING_CANCELLED", {
+                        self._emit("trade", f"Order expired — {trade['symbol']}",
+                                   f"{trade['direction']} #{ticket} cancelled unfilled", "warning",
+                                   trade["symbol"])
+                        self._announce_update(trade, "PENDING_CANCELLED", {
                             "symbol": trade["symbol"], "direction": trade["direction"],
                             "digits": digits, "ticket": ticket,
                             "reason": "Entry not reached before the setup expired — order cancelled."},
@@ -917,7 +964,10 @@ class TradingWorker:
                                        trade.get("tp2"), trade["id"])
                 log.info("Pending %s %s #%s filled @ %s", trade["symbol"], trade["direction"], ticket,
                          position.price_open)
-                self.telegram.broadcast_trade_update("PENDING_FILLED", {
+                self._emit("trade", f"Order filled — {trade['symbol']}",
+                           f"{trade['direction']} #{position.ticket} @ {position.price_open}", "success",
+                           trade["symbol"])
+                self._announce_update(trade, "PENDING_FILLED", {
                     "symbol": trade["symbol"], "direction": trade["direction"], "digits": digits,
                     "price": position.price_open, "sl": position.sl, "tp": position.tp,
                     "ticket": position.ticket, "strategy": trade.get("strategy")},
@@ -1005,6 +1055,10 @@ class TradingWorker:
                                                        + float(partial_pnl or 0.0), 2))
             log.info("TP1 hit on %s #%s (%s)", position.symbol, position.ticket,
                      f"closed {closed_volume} lots" if closed_volume else "no partial")
+            self._emit("trade", f"TP1 hit — {position.symbol}",
+                       f"#{position.ticket} " + (f"closed {closed_volume:g} lots" if closed_volume
+                                                 else "no partial close"), "success",
+                       self._canonical_for(position.symbol))
             self.telegram.broadcast_trade_update(
                 "TP1_HIT", {**base, "price": price, "closed_volume": closed_volume, "pnl": partial_pnl},
                 reply_to=reply_to, dedupe_key=f"tp1:{position.ticket}")
@@ -1018,12 +1072,18 @@ class TradingWorker:
                 if event == "BREAKEVEN" and not managed.be_moved:
                     log.info("SL moved to breakeven on %s #%s -> %s", position.symbol,
                              position.ticket, decision.new_sl)
+                    self._emit("trade", f"Breakeven — {position.symbol}",
+                               f"#{position.ticket} SL → {decision.new_sl}", "info",
+                               self._canonical_for(position.symbol))
                     self.telegram.broadcast_trade_update(
                         "BREAKEVEN", {**base, "sl": decision.new_sl}, reply_to=reply_to,
                         dedupe_key=f"be:{position.ticket}")
                 elif event == "TRAILING_ON" and not managed.trailing_active:
                     log.info("Trailing stop activated on %s #%s -> %s", position.symbol,
                              position.ticket, decision.new_sl)
+                    self._emit("trade", f"Trailing stop on — {position.symbol}",
+                               f"#{position.ticket} SL → {decision.new_sl}", "info",
+                               self._canonical_for(position.symbol))
                     self.telegram.broadcast_trade_update(
                         "TRAILING_ON", {**base, "sl": decision.new_sl}, reply_to=reply_to,
                         dedupe_key=f"trail:{position.ticket}")
@@ -1096,6 +1156,10 @@ class TradingWorker:
                  trade["direction"], ticket, summary.price_close, reason, summary.profit,
                  f"{pips:.1f}" if pips is not None else "-",
                  f"{r_multiple:.2f}" if r_multiple is not None else "-")
+        self._emit("trade", f"Closed {trade['symbol']} {summary.profit:+.2f}",
+                   f"{trade['direction']} #{ticket} · {reason}"
+                   + (f" · {r_multiple:+.2f}R" if r_multiple is not None else ""),
+                   "success" if summary.profit >= 0 else "danger", trade["symbol"])
         manual = trade.get("setup") == "manual"
         if broadcast and (not manual or self.settings.telegram.broadcast_manual):
             spec = self.broker.get_symbol_spec(trade["broker_symbol"]) if self.broker else None
@@ -1162,6 +1226,8 @@ class TradingWorker:
                                                     dedupe_key=key):
                 log.warning("Pre-news warning queued: %s %s in %.0f min", event.currency, event.title,
                             seconds / 60.0)
+                self._emit("news", f"{event.currency} news in {seconds / 60.0:.0f} min", event.title,
+                           "warning")
 
     def _update_news_locks(self, now: datetime) -> None:
         locks: dict[str, Any] = {}
@@ -1176,12 +1242,15 @@ class TradingWorker:
             previous = self._news_lock_state.get(canonical, False)
             if status.active and not previous:
                 log.warning("NEWS LOCK ON %s — %s", canonical, status.describe())
+                self._emit("news", f"News lock ON — {canonical}", status.describe(), "warning", canonical)
                 if self.runtime.news_auto_pause and self.settings.telegram.admin_news_lock_alerts and event:
                     self.telegram.alert_admin(
                         format_status_alert(f"News lock ON — {canonical}", status.describe(), "🔒"),
                         dedupe_key=f"newslock:{canonical}:{event.event_id}")
             elif not status.active and previous:
                 log.info("NEWS LOCK OFF %s — trading window reopened", canonical)
+                self._emit("news", f"News lock OFF — {canonical}", "trading window reopened", "info",
+                           canonical)
             self._news_lock_state[canonical] = status.active
             if status.active and status.phase == "PRE" and self.runtime.news_auto_pause:
                 self._apply_news_position_action(canonical, status)
@@ -1224,6 +1293,8 @@ class TradingWorker:
         self._update_bot_status()
         log.info("Bot STARTED (%s) — %s, risk %.2f%%", source, self.runtime.execution_mode,
                  self.runtime.risk_percent)
+        self._emit("bot", "Bot started",
+                   f"{self.runtime.execution_mode} · risk {self.runtime.risk_percent:.2f}%", "success")
         self.telegram.alert_admin(format_status_alert(
             "Bot started", f"Execution: {self.runtime.execution_mode} | Risk {self.runtime.risk_percent:.2f}%",
             "▶️"))
@@ -1233,6 +1304,7 @@ class TradingWorker:
         self.runtime.bot_enabled = False
         self._update_bot_status()
         log.info("Bot PAUSED (%s) — open positions stay protected", source)
+        self._emit("bot", "Bot paused", "no new entries — open positions stay protected", "warning")
         self.telegram.alert_admin(format_status_alert(
             "Bot paused", "No new entries. Open positions remain managed.", "⏸️"))
         return self._get_state("bot_status")
@@ -1260,6 +1332,8 @@ class TradingWorker:
             errors.append(str(exc))
         log.critical("PANIC CLOSE by %s: closed %s, cancelled %s, failed %s", source, closed,
                      cancelled, failed)
+        self._emit("risk", "Panic close executed",
+                   f"closed {closed} · cancelled {cancelled} · failed {failed}", "danger")
         self.telegram.emergency("PANIC CLOSE EXECUTED",
                                 [f"Closed {closed} position(s), cancelled {cancelled} order(s)",
                                  f"Failures: {failed}", "Bot paused."], also_channel=False)
@@ -1317,7 +1391,8 @@ class TradingWorker:
 
     def preview_manual_trade(self, canonical: str, direction: str, risk_percent: float,
                              sl_mode: str, sl_value: float, tp1_rr: float | None = None,
-                             tp2_rr: float | None = None) -> dict[str, Any]:
+                             tp2_rr: float | None = None, order_kind: str = "MARKET",
+                             entry_price: float | None = None) -> dict[str, Any]:
         broker = self.broker
         if broker is None:
             return {"ok": False, "error": self.broker_error or "broker unavailable"}
@@ -1328,9 +1403,28 @@ class TradingWorker:
         account = self._account_cache or broker.get_account()
         if tick is None or spec is None or account is None:
             return {"ok": False, "error": "market data / account unavailable"}
-        direction = direction.upper()
+        direction = str(direction).upper()
+        if direction not in ("BUY", "SELL"):
+            return {"ok": False, "error": "direction must be BUY or SELL"}
+        order_kind = str(order_kind or "MARKET").upper()
+        if order_kind not in ("MARKET", "LIMIT", "STOP"):
+            return {"ok": False, "error": "order type must be MARKET, LIMIT or STOP"}
         sign = 1.0 if direction == "BUY" else -1.0
-        entry = tick.ask if direction == "BUY" else tick.bid
+        market = tick.ask if direction == "BUY" else tick.bid
+        if order_kind == "MARKET":
+            entry = market
+        else:
+            if not entry_price or float(entry_price) <= 0:
+                return {"ok": False, "error": f"enter a {order_kind.lower()} price", "digits": spec.digits,
+                        "market_price": market}
+            entry = spec.normalize_price(float(entry_price))
+            valid = {("BUY", "LIMIT"): entry < tick.ask, ("SELL", "LIMIT"): entry > tick.bid,
+                     ("BUY", "STOP"): entry > tick.ask, ("SELL", "STOP"): entry < tick.bid}[(direction, order_kind)]
+            if not valid:
+                side = "below" if (direction, order_kind) in (("BUY", "LIMIT"), ("SELL", "STOP")) else "above"
+                return {"ok": False, "error": f"{direction} {order_kind} price must be {side} the market "
+                                              f"price {market:.{spec.digits}f}",
+                        "digits": spec.digits, "market_price": market, "entry": entry}
         pip = pip_size_for(canonical, spec.point, spec.digits)
         atr = self._atr_for(canonical, symbol)
         if sl_mode == "atr":
@@ -1364,13 +1458,15 @@ class TradingWorker:
                 "risk_amount": round(size.actual_risk, 2), "risk_percent": round(size.actual_risk_percent, 3),
                 "spread_points": round(tick.spread_points(spec.point), 1), "digits": spec.digits,
                 "sl_pips": round(distance / pip, 1) if pip else None, "atr": atr,
-                "news_lock": blackout.active, "news_label": blackout.describe()}
+                "news_lock": blackout.active, "news_label": blackout.describe(),
+                "order_kind": order_kind, "market_price": market}
 
     def manual_trade(self, canonical: str, direction: str, risk_percent: float, sl_mode: str,
                      sl_value: float, tp1_rr: float | None = None, tp2_rr: float | None = None,
-                     override_news: bool = False) -> dict[str, Any]:
+                     override_news: bool = False, order_kind: str = "MARKET",
+                     entry_price: float | None = None) -> dict[str, Any]:
         preview = self.preview_manual_trade(canonical, direction, risk_percent, sl_mode, sl_value,
-                                            tp1_rr, tp2_rr)
+                                            tp1_rr, tp2_rr, order_kind, entry_price)
         if not preview.get("ok"):
             return preview
         if (self._get_state("drawdown") or {}).get("halted"):
@@ -1378,6 +1474,8 @@ class TradingWorker:
                                           "the next trading day"}
         if preview["news_lock"] and not override_news:
             return {"ok": False, "error": f"News blackout: {preview['news_label']} (tick override)"}
+        if preview["order_kind"] != "MARKET":
+            return self._place_manual_pending(canonical, preview)
         broker = self.broker
         assert broker is not None
         symbol = preview["broker_symbol"]
@@ -1403,19 +1501,59 @@ class TradingWorker:
                                    preview["sl"], preview["tp1"], preview["tp2"], trade_id)
         log.info("MANUAL %s %s %.2f lots @ %s (SL %s TP %s)", preview["direction"], canonical,
                  preview["lots"], fill, preview["sl"], preview["tp2"])
-        if self.settings.telegram.broadcast_manual:
-            spec = broker.get_symbol_spec(symbol)
-            payload = {"symbol": canonical, "direction": preview["direction"],
-                       "strategy": "Manual Execution (Discretionary)", "timeframe": self.settings.ltf,
-                       "entry": fill, "stop_loss": preview["sl"], "tp1": preview["tp1"],
-                       "tp2": preview["tp2"], "rr": preview["tp2_rr"], "tp1_rr": preview["tp1_rr"],
-                       "order_type": "MARKET", "lots": preview["lots"],
-                       "risk_percent": preview["risk_percent"], "risk_amount": preview["risk_amount"],
-                       "digits": spec.digits if spec else preview["digits"],
-                       "pip_size": pip_size_for(canonical), "created_at": now, "status": "EXECUTED"}
-            self.telegram.broadcast_trade_signal(
-                payload, on_sent=lambda res, tid=trade_id: self.db.update_trade(tid, telegram_message_id=res.message_id))
+        self._emit("trade", f"Manual {preview['direction']} {canonical}",
+                   f"{preview['lots']:g} lots @ {fill:.{preview['digits']}f} · SL {preview['sl']} · TP {preview['tp2']}",
+                   "success", canonical)
+        self._broadcast_manual(canonical, preview, trade_id, fill, "MARKET", now)
         return {"ok": True, "ticket": result.position_ticket, "price": fill, "lots": preview["lots"]}
+
+    def _broadcast_manual(self, canonical: str, preview: dict[str, Any], trade_id: int, entry: float,
+                          order_type: str, now: datetime) -> None:
+        if not self.settings.telegram.broadcast_manual or self.broker is None:
+            return
+        spec = self.broker.get_symbol_spec(preview["broker_symbol"])
+        payload = {"symbol": canonical, "direction": preview["direction"],
+                   "strategy": "Manual Execution (Discretionary)", "timeframe": self.settings.ltf,
+                   "entry": entry, "stop_loss": preview["sl"], "tp1": preview["tp1"],
+                   "tp2": preview["tp2"], "rr": preview["tp2_rr"], "tp1_rr": preview["tp1_rr"],
+                   "order_type": order_type, "lots": preview["lots"],
+                   "risk_percent": preview["risk_percent"], "risk_amount": preview["risk_amount"],
+                   "digits": spec.digits if spec else preview["digits"],
+                   "pip_size": pip_size_for(canonical), "created_at": now, "status": "EXECUTED"}
+        self.telegram.broadcast_trade_signal(
+            payload, on_sent=lambda res, tid=trade_id: self.db.update_trade(tid, telegram_message_id=res.message_id))
+
+    def _announce_update(self, trade: dict[str, Any], kind: str, data: dict[str, Any], **kwargs: Any) -> None:
+        """Trade-update broadcast that honours TELEGRAM_BROADCAST_MANUAL for discretionary trades."""
+        if trade.get("setup") == "manual" and not self.settings.telegram.broadcast_manual:
+            return
+        self.telegram.broadcast_trade_update(kind, data, **kwargs)
+
+    def _place_manual_pending(self, canonical: str, preview: dict[str, Any]) -> dict[str, Any]:
+        broker = self.broker
+        assert broker is not None
+        symbol, kind = preview["broker_symbol"], preview["order_kind"]
+        result = broker.place_pending_order(symbol, preview["direction"], kind, preview["entry"],
+                                            preview["lots"], sl=preview["sl"], tp=preview["tp2"],
+                                            comment="QT manual")
+        if not result.success:
+            log.error("Manual %s %s %s failed: %s", preview["direction"], kind, canonical, result.message)
+            return {"ok": False, "error": result.message}
+        trade_id = self.db.insert_trade(
+            mode=broker.mode, symbol=canonical, broker_symbol=symbol, direction=preview["direction"],
+            order_type=kind, strategy="Manual Execution", setup="manual", timeframe=self.settings.ltf,
+            status="PENDING", order_ticket=result.order_ticket, magic=self.settings.mt5.magic,
+            volume=preview["lots"], volume_open=preview["lots"], entry_price=preview["entry"],
+            sl_initial=preview["sl"], sl_current=preview["sl"], tp1=preview["tp1"], tp2=preview["tp2"],
+            risk_amount=preview["risk_amount"], risk_percent=preview["risk_percent"],
+            rr_planned=preview["tp2_rr"], confluences=["Discretionary"])
+        log.info("MANUAL %s %s %s %.2f lots @ %s (SL %s TP %s)", preview["direction"], kind, canonical,
+                 preview["lots"], preview["entry"], preview["sl"], preview["tp2"])
+        self._emit("trade", f"{preview['direction']} {kind} placed — {canonical}",
+                   f"{preview['lots']:g} lots @ {preview['entry']:.{preview['digits']}f}", "info", canonical)
+        self._broadcast_manual(canonical, preview, trade_id, preview["entry"], kind, utc_now())
+        return {"ok": True, "pending": True, "order_ticket": result.order_ticket, "price": preview["entry"],
+                "lots": preview["lots"]}
 
     def close_position_manual(self, ticket: int) -> dict[str, Any]:
         if self.broker is None:
@@ -1423,7 +1561,53 @@ class TradingWorker:
         self._close_reasons[int(ticket)] = "MANUAL"
         result = self.broker.close_position(int(ticket), comment="dashboard close")
         log.info("Dashboard close #%s: %s", ticket, "OK" if result.success else result.message)
+        if result.success:
+            self._emit("trade", f"Close sent — #{ticket}", "position closed from the dashboard", "info")
         return {"ok": result.success, "error": None if result.success else result.message}
+
+    def modify_position_manual(self, ticket: int, sl: float | None = None,
+                               tp: float | None = None) -> dict[str, Any]:
+        broker = self.broker
+        if broker is None:
+            return {"ok": False, "error": "broker unavailable"}
+        if sl is None and tp is None:
+            return {"ok": False, "error": "nothing to change"}
+        for value in (sl, tp):
+            if value is not None and float(value) <= 0:
+                return {"ok": False, "error": "prices must be positive"}
+        result = broker.modify_position(int(ticket), sl=sl, tp=tp)
+        if not result.success:
+            return {"ok": False, "error": result.message}
+        trade = self.db.get_trade_by_position(int(ticket), self.mode)
+        if trade is not None:
+            changes: dict[str, Any] = {}
+            if sl is not None:
+                changes["sl_current"] = float(sl)
+            if tp is not None:
+                changes["tp2"] = float(tp)
+            self.db.update_trade(trade["id"], **changes)
+        managed = self._managed.get(int(ticket))
+        if managed is not None and tp is not None:
+            managed.tp2 = float(tp)
+        log.info("Dashboard modify #%s: SL %s TP %s", ticket, sl, tp)
+        self._emit("trade", f"Stops updated — #{ticket}", f"SL {sl if sl is not None else '—'} · "
+                                                          f"TP {tp if tp is not None else '—'}", "info")
+        return {"ok": True}
+
+    def cancel_order_manual(self, ticket: int) -> dict[str, Any]:
+        broker = self.broker
+        if broker is None:
+            return {"ok": False, "error": "broker unavailable"}
+        result = broker.cancel_order(int(ticket))
+        if not result.success:
+            return {"ok": False, "error": result.message}
+        trade = self.db.get_trade_by_order(int(ticket), self.mode)
+        if trade is not None and trade["status"] == "PENDING":
+            self.db.update_trade(trade["id"], status="CANCELLED", close_reason="MANUAL", closed_at=utc_now(),
+                                 notes="cancelled from the dashboard")
+        log.info("Dashboard cancel order #%s", ticket)
+        self._emit("trade", f"Order cancelled — #{ticket}", "pending order removed", "warning")
+        return {"ok": True}
 
     def move_to_breakeven(self, ticket: int, source: str = "dashboard") -> dict[str, Any]:
         broker = self.broker
@@ -1460,6 +1644,8 @@ class TradingWorker:
                                                  reply_to=trade.get("telegram_message_id"),
                                                  dedupe_key=f"be:{position.ticket}")
         log.info("Breakeven (%s) on #%s -> %s", source, position.ticket, level)
+        self._emit("trade", f"Breakeven — {position.symbol}", f"#{position.ticket} SL → {level}", "info",
+                   self._canonical_for(position.symbol))
         return {"ok": True, "sl": level}
 
     def send_test_signal(self) -> SendResult:
@@ -1514,6 +1700,7 @@ class TradingWorker:
         snapshot["telegram"] = self.telegram.stats_snapshot()
         snapshot["settings"] = self.settings.public_summary()
         snapshot["now"] = utc_now().isoformat(timespec="seconds")
+        snapshot["last_event_id"] = self.last_event_id
         return snapshot
 
     def get_analysis(self, canonical: str) -> MarketAnalysis | None:
@@ -1551,6 +1738,169 @@ class TradingWorker:
 
     def recent_logs(self, limit: int = 300, min_level: str | None = None) -> list[dict[str, Any]]:
         return self.log_handler.tail(limit, min_level)
+
+    # --------------------------------------------------------- web tools --
+    def _cached_tool(self, key: tuple[Any, ...], ttl: float, build: Callable[[], Any]) -> Any:
+        cached = self._tool_cache.get(key)
+        if cached is not None and time.monotonic() - cached[0] < ttl:
+            return cached[1]
+        value = build()
+        self._tool_cache[key] = (time.monotonic(), value)
+        return value
+
+    def _frame_for(self, canonical: str, timeframe: str, count: int) -> pd.DataFrame | None:
+        """Scanner frame when it is long enough, else a (cached) broker fetch; never raises."""
+        with self._state_lock:
+            frame = self._frames.get((canonical, timeframe))
+        if frame is not None and len(frame) >= count:
+            return frame
+        cached = self._chart_cache.get((canonical, timeframe))
+        if cached is not None and time.monotonic() - cached[0] < 60.0 and len(cached[1]) >= count:
+            return cached[1]
+        broker = self.broker
+        if broker is None or not self._get_state("broker_connected"):
+            return frame
+        try:
+            symbol = self._broker_symbol(canonical)
+            fetched = broker.get_rates(symbol, timeframe, count) if symbol else None
+        except BrokerError as exc:
+            self._log_throttled(f"frame-{canonical}-{timeframe}", logging.WARNING,
+                                "%s %s candles unavailable: %s", canonical, timeframe, exc)
+            return frame
+        if fetched is None or fetched.empty:
+            return frame
+        self._chart_cache[(canonical, timeframe)] = (time.monotonic(), fetched)
+        return fetched
+
+    def symbol_specs(self) -> dict[str, Any]:
+        """Contract specs + live quotes for the calculators (pip value, margin, lot size)."""
+        broker = self.broker
+        with self._state_lock:
+            account = self._account_cache
+            quotes = copy.deepcopy(self._state.get("symbols", {}))
+        currency = account.currency if account else self.settings.paper.account_currency
+        leverage = int(account.leverage) if account and account.leverage else None
+        rows: list[dict[str, Any]] = []
+        for canonical in self.settings.symbols:
+            row: dict[str, Any] = {"symbol": canonical, "available": False}
+            try:
+                symbol = self._broker_symbol(canonical) if broker is not None else None
+                spec = broker.get_symbol_spec(symbol) if broker is not None and symbol else None
+            except BrokerError:
+                symbol, spec = None, None
+            if spec is not None:
+                quote = quotes.get(canonical, {})
+                bid, ask = quote.get("bid"), quote.get("ask")
+                mid = (bid + ask) / 2.0 if bid and ask else None
+                pip = pip_size_for(canonical, spec.point, spec.digits)
+                per_unit = spec.tick_value / spec.tick_size if spec.tick_size > 0 else None
+                notional = mid * per_unit if mid and per_unit else None
+                row.update({"available": True, "broker_symbol": symbol, "digits": spec.digits,
+                            "point": spec.point, "tick_size": spec.tick_size,
+                            "tick_value": spec.tick_value, "contract_size": spec.contract_size,
+                            "volume_min": spec.volume_min, "volume_max": spec.volume_max,
+                            "volume_step": spec.volume_step, "pip": pip,
+                            "pip_value": per_unit * pip if per_unit else None,
+                            "value_per_unit": per_unit, "bid": bid, "ask": ask,
+                            "notional_per_lot": notional,
+                            "margin_per_lot": notional / leverage if notional and leverage else None,
+                            "currency_base": spec.currency_base,
+                            "currency_profit": spec.currency_profit,
+                            "description": spec.description})
+            rows.append(row)
+        return {"account_currency": currency, "leverage": leverage,
+                "balance": account.balance if account else None,
+                "equity": account.equity if account else None, "symbols": rows}
+
+    def sparklines(self, points: int = 96, timeframe: str | None = None) -> dict[str, list[float]]:
+        """Recent closes per symbol for watchlist mini-charts (scanner cache only — no I/O)."""
+        timeframe = timeframe or self.settings.mtf
+        with self._state_lock:
+            frames = {c: self._frames.get((c, timeframe)) for c in self.settings.symbols}
+        result: dict[str, list[float]] = {}
+        for canonical, frame in frames.items():
+            if frame is None or frame.empty or "close" not in frame:
+                result[canonical] = []
+                continue
+            closes = frame["close"].astype(float).tail(max(2, int(points)))
+            result[canonical] = [round(float(value), 6) for value in closes]
+        return result
+
+    def correlation(self, timeframe: str | None = None, bars: int = 200) -> dict[str, Any]:
+        timeframe = (timeframe or self.settings.htf).upper()
+        bars = max(20, min(int(bars), 1000))
+
+        def build() -> dict[str, Any]:
+            closes = {}
+            for canonical in self.settings.symbols:
+                frame = self._frame_for(canonical, timeframe, bars + 5)
+                if frame is not None and not frame.empty and "close" in frame:
+                    closes[canonical] = prepare_ohlcv(frame)["close"]
+            result = correlation_matrix(closes, bars)
+            result["timeframe"] = timeframe
+            return result
+
+        return self._cached_tool(("correlation", timeframe, bars), 120.0, build)
+
+    def volatility(self) -> list[dict[str, Any]]:
+        """ADR (14 days of H1 bars), today's range used and the strategy-timeframe ATR."""
+
+        def build() -> list[dict[str, Any]]:
+            rows = []
+            broker = self.broker
+            for canonical in self.settings.symbols:
+                spec = None
+                try:
+                    symbol = self._broker_symbol(canonical) if broker is not None else None
+                    spec = broker.get_symbol_spec(symbol) if broker is not None and symbol else None
+                except BrokerError:
+                    spec = None
+                pip = pip_size_for(canonical, spec.point if spec else None, spec.digits if spec else None)
+                frame = self._frame_for(canonical, "H1", 24 * 16)
+                analysis = self.get_analysis(canonical)
+                features = getattr(analysis, "features", None)
+                atr = float(features.atr_now) if features is not None and features.atr_now else None
+                h1 = prepare_ohlcv(frame) if frame is not None else None
+                row = volatility_row(canonical, h1, pip, atr)
+                row["digits"] = spec.digits if spec else None
+                rows.append(row)
+            return rows
+
+        return self._cached_tool(("volatility",), 120.0, build)
+
+    def reset_paper_account(self, balance: float | None = None,
+                            clear_history: bool = False) -> dict[str, Any]:
+        """Paper mode only: flatten the simulated account and restart from a clean balance."""
+        broker = self.broker
+        if broker is None or broker.mode != "PAPER" or not hasattr(broker, "reset_account"):
+            return {"ok": False, "error": "account reset is only available in paper mode"}
+        if balance is not None and float(balance) <= 0:
+            return {"ok": False, "error": "balance must be positive"}
+        now = utc_now()
+        broker.reset_account(balance)
+        with self._state_lock:
+            self._managed.clear()
+            self._closing_retries.clear()
+            self._known_positions = set()
+            self._positions_cache, self._orders_cache = [], []
+        purged = {"trades": 0, "equity_points": 0}
+        if clear_history:
+            purged = self.db.purge_mode_history(broker.mode)
+        else:
+            for trade in self.db.get_active_trades(broker.mode):
+                self.db.update_trade(trade["id"], status="CANCELLED", close_reason="RESET",
+                                     closed_at=now, volume_open=0.0, notes="paper account reset")
+        account = broker.get_account()
+        if account is not None:
+            self.dd_guard.rebase(account, now)
+            with self._state_lock:
+                self._account_cache = account
+            self._set_state(account=account.to_dict(), positions=[], orders=[])
+        new_balance = account.balance if account else float(balance or 0.0)
+        log.warning("Paper account reset to %.2f (history %s)", new_balance,
+                    "cleared" if clear_history else "kept")
+        self._emit("bot", "Paper account reset", f"new balance {new_balance:,.2f}", "warning")
+        return {"ok": True, "balance": new_balance, **purged}
 
 
 # --------------------------------------------------------------------------- #

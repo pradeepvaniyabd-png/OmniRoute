@@ -329,6 +329,25 @@ class AppSettings:
 
 
 @dataclass(frozen=True)
+class WebSettings:
+    host: str
+    port: int
+    password: str
+    session_secret: str
+    session_hours: float
+    open_browser: bool
+    allow_insecure_remote: bool
+
+    @property
+    def auth_enabled(self) -> bool:
+        return bool(self.password)
+
+    @property
+    def is_loopback(self) -> bool:
+        return self.host in ("127.0.0.1", "localhost", "::1")
+
+
+@dataclass(frozen=True)
 class Settings:
     broker_mode: str
     symbols: tuple[str, ...]
@@ -347,6 +366,7 @@ class Settings:
     news: NewsSettings
     telegram: TelegramSettings
     app: AppSettings
+    web: WebSettings
 
     def public_summary(self) -> dict[str, Any]:
         """Non-secret overview for the dashboard."""
@@ -731,6 +751,19 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         chart_timezone=env.get_tz("CHART_TIMEZONE", "Asia/Kolkata"),
     )
 
+    web = WebSettings(
+        host=env.get_str("WEB_HOST", "127.0.0.1"),
+        port=env.get_int("WEB_PORT", 8800, 1, 65535),
+        password=env.get_str("WEB_PASSWORD"),
+        session_secret=env.get_str("WEB_SESSION_SECRET"),
+        session_hours=env.get_float("WEB_SESSION_HOURS", 12.0, 0.25, 720.0),
+        open_browser=env.get_bool("WEB_OPEN_BROWSER", True),
+        allow_insecure_remote=env.get_bool("WEB_ALLOW_INSECURE_REMOTE", False),
+    )
+    if not web.is_loopback and not web.auth_enabled and not web.allow_insecure_remote:
+        raise ConfigError(f"WEB_HOST={web.host} exposes the terminal to the network — set WEB_PASSWORD "
+                          "(or WEB_ALLOW_INSECURE_REMOTE=true if a reverse proxy handles auth)")
+
     return Settings(
         broker_mode=broker_mode,
         symbols=symbols,
@@ -749,6 +782,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         news=news,
         telegram=telegram,
         app=app,
+        web=web,
     )
 
 

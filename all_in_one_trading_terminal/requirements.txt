@@ -11,7 +11,12 @@ MetaTrader5>=5.0.4424; sys_platform == "win32"
 pandas>=2.2
 numpy>=1.26
 
-# Dashboard
+# Web terminal (FastAPI REST + WebSocket live feed)
+fastapi>=0.115,<1.0
+uvicorn>=0.30
+websockets>=13
+
+# Classic dashboard (run_terminal.bat classic)
 streamlit>=1.50
 streamlit-lightweight-charts>=0.7.20
 

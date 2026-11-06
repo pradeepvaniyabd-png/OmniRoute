@@ -5,14 +5,16 @@ cd /d "%~dp0"
 
 rem ===========================================================================
 rem  One-click launcher
-rem    run_terminal.bat                   -> dashboard (opens the browser)
+rem    run_terminal.bat                   -> web terminal  http://127.0.0.1:8800
+rem    run_terminal.bat --start           -> web terminal + enable trading now
+rem    run_terminal.bat classic           -> classic Streamlit dashboard (:8501)
 rem    run_terminal.bat headless          -> trading engine only (VPS mode)
 rem    run_terminal.bat headless --start  -> headless + enable trading now
 rem  First run: creates .venv, installs requirements, creates .env from template.
 rem  Later runs: reinstalls only when requirements.txt changes.
 rem ===========================================================================
 
-set "PORT=8501"
+set "CLASSIC_PORT=8501"
 set "PY="
 where py >nul 2>nul && set "PY=py -3"
 if not defined PY (
@@ -28,7 +30,7 @@ if not defined PY (
 if not exist ".venv\Scripts\python.exe" (
     %PY% -c "import sys,struct;sys.exit(0 if sys.version_info[:2]>=(3,11) and struct.calcsize('P')==8 else 1)"
     if errorlevel 1 (
-        echo [ERROR] Python 3.11 or newer, 64-bit, is required ^(MetaTrader5 + Streamlit^).
+        echo [ERROR] Python 3.11 or newer, 64-bit, is required ^(MetaTrader5 package^).
         pause
         exit /b 1
     )
@@ -69,8 +71,14 @@ if /i "%~1"=="headless" (
     goto :finish
 )
 
-echo [START] Dashboard on http://localhost:%PORT%  - press Ctrl+C in this window to stop.
-"%VPY%" -m streamlit run app.py --server.port %PORT% --server.headless false --browser.gatherUsageStats false
+if /i "%~1"=="classic" (
+    echo [START] Classic dashboard on http://localhost:%CLASSIC_PORT%  - press Ctrl+C to stop.
+    "%VPY%" -m streamlit run app.py --server.port %CLASSIC_PORT% --server.headless false --browser.gatherUsageStats false
+    goto :finish
+)
+
+echo [START] Web terminal - the browser opens automatically. Press Ctrl+C in this window to stop.
+"%VPY%" server.py %*
 
 :finish
 if errorlevel 1 (
